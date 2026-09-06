@@ -483,4 +483,23 @@ mod tests {
         assert_eq!(progress.tick_count(), 4);
         cleanup(&root);
     }
+
+    #[test]
+    fn walk_phase_ticks_during_approximate_progress() {
+        let root = tmp();
+        fs::write(root.join("keep.dat"), b"k").unwrap();
+        let progress = CountingProgress::new();
+        progress.begin_walk_phase("Walking filesystem (npm)", 10);
+        let walked = walk_matching_files_with_progress(
+            [&root],
+            |_p, _n| false,
+            |_p, name| name == "keep.dat",
+            &progress,
+        );
+        progress.end_walk_phase();
+        assert_eq!(walked.files.len(), 1);
+        assert_eq!(progress.tick_count(), 1);
+        assert_eq!(progress.display_percents().last(), Some(&100));
+        cleanup(&root);
+    }
 }

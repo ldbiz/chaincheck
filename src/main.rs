@@ -101,5 +101,28 @@ fn primary_root(scope: &ScanScope) -> String {
 }
 
 fn progress_enabled(config: &ProcessConfig) -> bool {
-    !config.no_progress && io::stderr().is_terminal()
+    progress_enabled_with(config, io::stderr().is_terminal())
+}
+
+fn progress_enabled_with(config: &ProcessConfig, stderr_tty: bool) -> bool {
+    !config.no_progress && stderr_tty
+}
+
+#[cfg(test)]
+mod progress_gate_tests {
+    use super::*;
+    use chaincheck::cli::ProcessConfig;
+
+    #[test]
+    fn progress_disabled_when_chaincheck_no_progress_set() {
+        let mut config = ProcessConfig::default();
+        config.no_progress = true;
+        assert!(!progress_enabled_with(&config, true));
+    }
+
+    #[test]
+    fn progress_disabled_when_stderr_not_tty() {
+        let config = ProcessConfig::default();
+        assert!(!progress_enabled_with(&config, false));
+    }
 }
