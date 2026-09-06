@@ -247,6 +247,8 @@ fn binary_help_exits_zero_and_is_not_foundation() {
     assert!(!stdout.contains("rewrite foundation"));
     assert!(!stdout.contains("not the production scanner"));
     assert!(stdout.contains("chaincheck --self-test"));
+    assert!(stdout.contains("CHAINCHECK_NO_PROGRESS"));
+    assert!(stdout.contains("progress bar"));
 }
 
 #[test]

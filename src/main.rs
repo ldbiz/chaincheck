@@ -1,7 +1,6 @@
 //! Native ChainCheck scanner.
 
 use std::env;
-use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -13,8 +12,9 @@ use chaincheck::cli::{
 };
 use chaincheck::error::{ProcessExit, StartError};
 use chaincheck::intelligence::load_generic_intelligence;
+use chaincheck::progress::{MSG_INTEL, MSG_REPORT, TerminalProgress};
 use chaincheck::report::{console_brief, write_reports};
-use chaincheck::scan::{ScanScope, scan};
+use chaincheck::scan::{ScanScope, scan_with_progress};
 use chaincheck::self_test;
 
 fn main() -> ExitCode {
@@ -71,20 +71,21 @@ fn run_scan(
     println!("Primary root: {}", primary_root(&scope));
     println!("Report:       {}", report_dir.display());
     println!();
-    let progress = progress_enabled(&config);
-    if progress {
-        eprintln!("Acquiring malware intelligence…");
-    }
+    let progress = TerminalProgress::for_scan(&config);
+    progress.set_message(MSG_INTEL);
     let intelligence = load_generic_intelligence();
-    if progress {
-        eprintln!("Scanning…");
-    }
     let campaign = CampaignIntelligence::bundled();
-    let result = scan(scope, &config, home.as_deref(), intelligence, &campaign);
-    if progress {
-        eprintln!("Writing reports…");
-    }
+    let result = scan_with_progress(
+        scope,
+        &config,
+        home.as_deref(),
+        intelligence,
+        &campaign,
+        progress.as_ref(),
+    );
+    progress.set_message(MSG_REPORT);
     let written = write_reports(&result, &report_dir)?;
+    progress.finish();
     print!("{}", console_brief(&result, &written));
     let code = ProcessExit::Scan(result.outcome).exit_code();
     println!("Scan exit code: {code}");
@@ -97,8 +98,4 @@ fn primary_root(scope: &ScanScope) -> String {
         ScanScope::WholeUser { home } => home.display().to_string(),
         ScanScope::ExplicitRoot { root } => root.display().to_string(),
     }
-}
-
-fn progress_enabled(config: &ProcessConfig) -> bool {
-    !config.no_progress && io::stderr().is_terminal()
 }

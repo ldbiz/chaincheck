@@ -17,6 +17,7 @@ pub mod intelligence;
 pub mod model;
 pub mod npm;
 pub mod processutil;
+pub mod progress;
 pub mod python;
 pub mod report;
 pub mod scan;

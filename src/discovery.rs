@@ -8,6 +8,7 @@ use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 
 use crate::coverage::{ArtifactStatus, DetectorCoverage, DetectorId};
+use crate::progress::{NoProgress, ScanProgress};
 
 pub const DET_FILESYSTEM_WALK: DetectorId = DetectorId::from_static("filesystem-walk");
 
@@ -87,6 +88,15 @@ pub fn walk_matching_files(
     walk_matching_files_for(DET_FILESYSTEM_WALK, roots, prune_dir, keep_file)
 }
 
+pub(crate) fn walk_matching_files_with(
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    keep_file: impl FnMut(&Path, &OsStr) -> bool,
+    progress: &dyn ScanProgress,
+) -> WalkOutcome {
+    walk_matching_files_for_with(DET_FILESYSTEM_WALK, roots, prune_dir, keep_file, progress)
+}
+
 /// Same as [`walk_matching_files`], with caller-supplied coverage identity.
 pub fn walk_matching_files_for(
     detector: DetectorId,
@@ -94,12 +104,23 @@ pub fn walk_matching_files_for(
     prune_dir: impl FnMut(&Path, &OsStr) -> bool,
     keep_file: impl FnMut(&Path, &OsStr) -> bool,
 ) -> WalkOutcome {
-    walk_matching_files_for_limited(
+    walk_matching_files_for_with(detector, roots, prune_dir, keep_file, &NoProgress)
+}
+
+pub(crate) fn walk_matching_files_for_with(
+    detector: DetectorId,
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    keep_file: impl FnMut(&Path, &OsStr) -> bool,
+    progress: &dyn ScanProgress,
+) -> WalkOutcome {
+    walk_matching_files_for_limited_with(
         detector,
         roots,
         prune_dir,
         keep_file,
         WalkLimits::production(),
+        progress,
     )
 }
 
@@ -107,9 +128,20 @@ pub fn walk_matching_files_for(
 pub fn walk_matching_files_for_limited(
     detector: DetectorId,
     roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    keep_file: impl FnMut(&Path, &OsStr) -> bool,
+    limits: WalkLimits,
+) -> WalkOutcome {
+    walk_matching_files_for_limited_with(detector, roots, prune_dir, keep_file, limits, &NoProgress)
+}
+
+pub(crate) fn walk_matching_files_for_limited_with(
+    detector: DetectorId,
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
     mut prune_dir: impl FnMut(&Path, &OsStr) -> bool,
     mut keep_file: impl FnMut(&Path, &OsStr) -> bool,
     limits: WalkLimits,
+    progress: &dyn ScanProgress,
 ) -> WalkOutcome {
     let mut coverage = DetectorCoverage::attempted(detector);
     let mut files = Vec::new();
@@ -136,6 +168,7 @@ pub fn walk_matching_files_for_limited(
                 exhausted = Some("directory entries");
                 break 'walk;
             }
+            progress.tick();
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -416,6 +449,19 @@ mod tests {
         );
         assert_eq!(walked.files.len(), 5);
         assert!(walked.coverage.cap_reached());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn walk_ticks_once_per_examined_entry() {
+        let root = tmp();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("sub/b.txt"), b"b").unwrap();
+        let progress = crate::progress::TickCount::new();
+        let walked = walk_matching_files_with([&root], |_p, _n| false, |_p, _n| true, &progress);
+        assert_eq!(walked.files.len(), 2);
+        assert_eq!(progress.tick_count(), 3);
         cleanup(&root);
     }
 }

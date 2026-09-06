@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkOutcome, walk_matching_files};
+use crate::discovery::{WalkOutcome, walk_matching_files_with};
 use crate::fsutil::{HostDirKind, TextReadOutcome, classify_host_dir, read_utf8_bounded};
+use crate::progress::{NoProgress, ScanProgress};
 use crate::scan::ScanScope;
 
 /// Directories the npm walk does not descend. This is not a global policy:
@@ -101,12 +102,21 @@ pub fn discover_npm(
     config: &ProcessConfig,
     home: Option<&Path>,
 ) -> NpmArtifacts {
+    discover_npm_with_progress(scope, config, home, &NoProgress)
+}
+
+pub(crate) fn discover_npm_with_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    progress: &dyn ScanProgress,
+) -> NpmArtifacts {
     let walk_roots = npm_package_roots(scope, config, home);
     let extra_failures = walk_roots.failures;
     let WalkOutcome {
         files,
         mut coverage,
-    } = walk_matching_files(walk_roots.dirs, npm_prune_dir, npm_keep_file);
+    } = walk_matching_files_with(walk_roots.dirs, npm_prune_dir, npm_keep_file, progress);
     for (path, status) in extra_failures {
         coverage.record_artifact(path, status);
     }
@@ -289,7 +299,7 @@ fn consider_host_cache_dir(
 mod tests {
     use super::*;
     use crate::cli::ProcessConfig;
-    use crate::discovery::walk_files;
+    use crate::discovery::{walk_files, walk_matching_files};
     use crate::scan::ScanScope;
     use std::ffi::OsStr;
     use std::fs;
