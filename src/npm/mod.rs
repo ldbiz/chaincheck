@@ -24,12 +24,13 @@ use crate::model::{
     EvidenceKind, FindingCode, FindingSubject, IntelligenceSourceId, PackageIdentity, PackageKey,
     PackageVersion, Severity,
 };
+use crate::progress::{NoProgress, Progress};
 use crate::scan::{DetectorOutput, ScanResult, ScanScope, merge_outputs};
 
 pub use cache::scan_npm_cache;
-pub(crate) use discover::discover_npm_with_progress;
+pub(crate) use discover::{count_npm_walk_entries, discover_npm_with_progress, npm_host_cache_index_roots};
 pub use discover::{NpmArtifacts, PackageRoots, discover_npm, npm_package_roots, npm_prune_dir};
-pub use logs::scan_npm_logs;
+pub use logs::{scan_npm_logs, scan_npm_logs_with_progress};
 
 pub const DET_MANIFEST: DetectorId = DetectorId::from_static("manifest");
 pub const DET_NPM_LOCKFILE: DetectorId = DetectorId::from_static("npm-lockfile");
@@ -112,40 +113,53 @@ pub fn scan_npm_artifacts(
     artifacts: &NpmArtifacts,
     intel: &EcosystemIntelligence,
 ) -> Vec<DetectorOutput> {
+    scan_npm_artifacts_with_progress(artifacts, intel, &NoProgress)
+}
+
+pub fn scan_npm_artifacts_with_progress(
+    artifacts: &NpmArtifacts,
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> Vec<DetectorOutput> {
     vec![
-        scan_files(
+        scan_files_with_progress(
             &artifacts.manifests,
             intel,
             DET_MANIFEST,
             manifest::scan_manifest,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.npm_locks,
             intel,
             DET_NPM_LOCKFILE,
             lockfile::scan_npm_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.yarn_locks,
             intel,
             DET_YARN_LOCKFILE,
             lockfile::scan_yarn_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.pnpm_locks,
             intel,
             DET_PNPM_LOCKFILE,
             lockfile::scan_pnpm_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.bun_locks,
             intel,
             DET_TEXT_LOCKFILE,
             lockfile::scan_bun_lock,
+            progress,
         ),
-        lockfile::scan_bun_lockb(&artifacts.bun_lockb),
-        scan_discovered_logs(artifacts, intel),
-        scan_discovered_cache(artifacts, intel),
+        scan_bun_lockb_with_progress(&artifacts.bun_lockb, progress),
+        scan_discovered_logs_with_progress(artifacts, intel, progress),
+        scan_discovered_cache_with_progress(artifacts, intel, progress),
     ]
 }
 
@@ -197,6 +211,14 @@ fn scan_discovered_logs(
     artifacts: &discover::NpmArtifacts,
     intel: &EcosystemIntelligence,
 ) -> DetectorOutput {
+    scan_discovered_logs_with_progress(artifacts, intel, &NoProgress)
+}
+
+fn scan_discovered_logs_with_progress(
+    artifacts: &discover::NpmArtifacts,
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     if artifacts.logs.is_empty() && artifacts.log_dir_failures.is_empty() {
         return skipped(DET_NPM_LOGS);
     }
@@ -207,7 +229,7 @@ fn scan_discovered_logs(
             coverage: DetectorCoverage::attempted(DET_NPM_LOGS),
         }
     } else {
-        scan_npm_logs(&artifacts.logs, intel)
+        scan_npm_logs_with_progress(&artifacts.logs, intel, progress)
     };
     for (path, status) in &artifacts.log_dir_failures {
         output.coverage.record_artifact(path.clone(), *status);
@@ -219,6 +241,14 @@ fn scan_discovered_cache(
     artifacts: &discover::NpmArtifacts,
     intel: &EcosystemIntelligence,
 ) -> DetectorOutput {
+    scan_discovered_cache_with_progress(artifacts, intel, &NoProgress)
+}
+
+fn scan_discovered_cache_with_progress(
+    artifacts: &discover::NpmArtifacts,
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     if artifacts.cache_index_roots.is_empty() && artifacts.cache_root_failures.is_empty() {
         return skipped(DET_NPM_CACHE);
     }
@@ -229,7 +259,7 @@ fn scan_discovered_cache(
             coverage: DetectorCoverage::attempted(DET_NPM_CACHE),
         }
     } else {
-        scan_npm_cache(&artifacts.cache_index_roots, intel)
+        cache::scan_npm_cache_with_progress(&artifacts.cache_index_roots, intel, progress)
     };
     for (path, status) in &artifacts.cache_root_failures {
         output.coverage.record_artifact(path.clone(), *status);
@@ -243,6 +273,16 @@ fn scan_files(
     id: DetectorId,
     scan_one: fn(&Path, &EcosystemIntelligence) -> FileScan,
 ) -> DetectorOutput {
+    scan_files_with_progress(paths, intel, id, scan_one, &NoProgress)
+}
+
+fn scan_files_with_progress(
+    paths: &[PathBuf],
+    intel: &EcosystemIntelligence,
+    id: DetectorId,
+    scan_one: fn(&Path, &EcosystemIntelligence) -> FileScan,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     if paths.is_empty() {
         return skipped(id);
     }
@@ -250,6 +290,7 @@ fn scan_files(
     let mut package_evidence = Vec::new();
     let mut coverage = DetectorCoverage::attempted(id);
     for path in paths {
+        progress.tick();
         let result = scan_one(path, intel);
         coverage.record_artifact(path.clone(), result.status);
         findings.extend(result.findings);
@@ -260,6 +301,17 @@ fn scan_files(
         package_evidence,
         coverage,
     }
+}
+
+fn scan_bun_lockb_with_progress(paths: &[PathBuf], progress: &dyn Progress) -> DetectorOutput {
+    if paths.is_empty() {
+        return skipped(DET_BUN_LOCKB);
+    }
+    for path in paths {
+        progress.tick();
+        let _ = path;
+    }
+    lockfile::scan_bun_lockb(paths)
 }
 
 pub(crate) fn skipped(id: DetectorId) -> DetectorOutput {

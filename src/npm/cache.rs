@@ -8,6 +8,7 @@ use crate::evidence::EvidenceClass;
 use crate::fsutil::{read_text_lossy_bounded, text_artifact_status};
 use crate::intelligence::EcosystemIntelligence;
 use crate::model::{EvidenceKind, Severity};
+use crate::progress::{NoProgress, Progress};
 use crate::scan::DetectorOutput;
 
 use super::{
@@ -17,7 +18,21 @@ use super::{
 use crate::discovery::{EntryBudget, WalkLimits};
 
 pub fn scan_npm_cache(roots: &[impl AsRef<Path>], intel: &EcosystemIntelligence) -> DetectorOutput {
-    scan_npm_cache_limited(roots, intel, CACHE_FILE_CAP)
+    scan_npm_cache_with_progress(roots, intel, &NoProgress)
+}
+
+pub fn scan_npm_cache_with_progress(
+    roots: &[impl AsRef<Path>],
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
+    scan_npm_cache_bounded_with_progress(
+        roots,
+        intel,
+        CACHE_FILE_CAP,
+        WalkLimits::production().max_entries,
+        progress,
+    )
 }
 
 pub(crate) fn scan_npm_cache_limited(
@@ -33,6 +48,16 @@ pub(crate) fn scan_npm_cache_bounded(
     intel: &EcosystemIntelligence,
     cap: u32,
     max_entries: u32,
+) -> DetectorOutput {
+    scan_npm_cache_bounded_with_progress(roots, intel, cap, max_entries, &NoProgress)
+}
+
+pub(crate) fn scan_npm_cache_bounded_with_progress(
+    roots: &[impl AsRef<Path>],
+    intel: &EcosystemIntelligence,
+    cap: u32,
+    max_entries: u32,
+    progress: &dyn Progress,
 ) -> DetectorOutput {
     if roots.is_empty() {
         return skipped(DET_NPM_CACHE);
@@ -73,6 +98,7 @@ pub(crate) fn scan_npm_cache_bounded(
                     truncated_entries = true;
                     break 'roots;
                 }
+                progress.tick();
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {

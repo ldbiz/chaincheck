@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::DetectorCoverage;
-use crate::discovery::{WalkOutcome, walk_matching_files_for_with_progress};
+use crate::discovery::{
+    WalkLimits, WalkOutcome, count_matching_entries_for_limited_with,
+    walk_matching_files_for_with_progress,
+};
 use crate::npm::npm_package_roots;
 use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
@@ -122,5 +125,31 @@ pub fn discover_campaign_with_progress(
         }
     }
 
+    progress.add_work(
+        count_campaign_scannable_files(&artifacts) + artifacts.git_repos.len() as u64,
+    );
+
     artifacts
+}
+
+pub(crate) fn count_campaign_walk_entries(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+) -> u32 {
+    let roots = npm_package_roots(scope, config, home);
+    count_matching_entries_for_limited_with(
+        roots.dirs,
+        |parent, name| {
+            if name == ".git" {
+                return true;
+            }
+            campaign_prune_dir(parent, name)
+        },
+        WalkLimits::production(),
+    )
+}
+
+pub(crate) fn count_campaign_scannable_files(artifacts: &CampaignArtifacts) -> u64 {
+    (artifacts.payloads.len() + artifacts.ide_configs.len()) as u64
 }

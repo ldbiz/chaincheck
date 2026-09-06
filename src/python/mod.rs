@@ -12,7 +12,9 @@ pub mod wheel_cache;
 
 use std::path::{Path, PathBuf};
 
-pub(crate) use discover::discover_python_with_progress;
+pub(crate) use discover::{
+    count_python_walk_entries, discover_python_with_progress, pip_wheel_roots_for_scan,
+};
 pub use discover::{
     PythonArtifacts, PythonHostLayout, discover_python, discover_python_with_layout,
     python_keep_file,
@@ -27,6 +29,7 @@ use crate::model::{
     EvidenceKind, FindingCode, FindingSubject, IntelligenceSourceId, PackageIdentity, PackageKey,
     PackageVersion, Severity,
 };
+use crate::progress::{NoProgress, Progress};
 use crate::scan::{DetectorOutput, ScanResult, ScanScope, merge_outputs};
 
 pub const DET_DISCOVERY: DetectorId = DetectorId::from_static("python-discovery");
@@ -101,58 +104,79 @@ pub fn scan_python_artifacts(
     artifacts: &PythonArtifacts,
     intel: &EcosystemIntelligence,
 ) -> Vec<DetectorOutput> {
+    scan_python_artifacts_with_progress(artifacts, intel, &NoProgress)
+}
+
+pub fn scan_python_artifacts_with_progress(
+    artifacts: &PythonArtifacts,
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> Vec<DetectorOutput> {
     vec![
-        scan_metadata_files(&artifacts.metadata, intel),
-        scan_requirements_detector(&artifacts.requirements, intel, &artifacts.include_roots),
-        scan_files(
+        scan_metadata_files_with_progress(&artifacts.metadata, intel, progress),
+        scan_requirements_detector_with_progress(
+            &artifacts.requirements,
+            intel,
+            &artifacts.include_roots,
+            progress,
+        ),
+        scan_files_with_progress(
             &artifacts.pyprojects,
             intel,
             DET_PYPROJECT,
             pyproject::scan_pyproject,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.pipfiles,
             intel,
             DET_PIPFILE,
             pipfile::scan_pipfile,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.setup_cfgs,
             intel,
             DET_SETUP_CFG,
             setup_cfg::scan_setup_cfg,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.pylock_tomls,
             intel,
             DET_PYLOCK,
             lockfile::scan_pylock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.uv_locks,
             intel,
             DET_UV_LOCK,
             lockfile::scan_uv_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.poetry_locks,
             intel,
             DET_POETRY_LOCK,
             lockfile::scan_poetry_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.pipfile_locks,
             intel,
             DET_PIPFILE_LOCK,
             lockfile::scan_pipfile_lock,
+            progress,
         ),
-        scan_files(
+        scan_files_with_progress(
             &artifacts.pdm_locks,
             intel,
             DET_PDM_LOCK,
             lockfile::scan_pdm_lock,
+            progress,
         ),
-        scan_discovered_wheel_cache(artifacts, intel),
+        scan_discovered_wheel_cache_with_progress(artifacts, intel, progress),
     ]
 }
 
@@ -165,13 +189,30 @@ pub fn apply_pypi_corroboration(
 }
 
 fn scan_metadata_files(paths: &[PathBuf], intel: &EcosystemIntelligence) -> DetectorOutput {
-    scan_files(paths, intel, DET_INSTALLED, installed::scan_metadata)
+    scan_metadata_files_with_progress(paths, intel, &NoProgress)
+}
+
+fn scan_metadata_files_with_progress(
+    paths: &[PathBuf],
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
+    scan_files_with_progress(paths, intel, DET_INSTALLED, installed::scan_metadata, progress)
 }
 
 fn scan_requirements_detector(
     paths: &[PathBuf],
     intel: &EcosystemIntelligence,
     include_roots: &[PathBuf],
+) -> DetectorOutput {
+    scan_requirements_detector_with_progress(paths, intel, include_roots, &NoProgress)
+}
+
+fn scan_requirements_detector_with_progress(
+    paths: &[PathBuf],
+    intel: &EcosystemIntelligence,
+    include_roots: &[PathBuf],
+    progress: &dyn Progress,
 ) -> DetectorOutput {
     if paths.is_empty() {
         return skipped(DET_REQUIREMENTS);
@@ -181,6 +222,7 @@ fn scan_requirements_detector(
     let mut coverage = DetectorCoverage::attempted(DET_REQUIREMENTS);
     let scans = requirements::scan_requirements_files(paths, intel, include_roots);
     for (path, result) in scans {
+        progress.tick();
         coverage.record_artifact(path, result.status);
         findings.extend(result.findings);
         package_evidence.extend(result.evidence);
@@ -196,6 +238,14 @@ fn scan_discovered_wheel_cache(
     artifacts: &PythonArtifacts,
     intel: &EcosystemIntelligence,
 ) -> DetectorOutput {
+    scan_discovered_wheel_cache_with_progress(artifacts, intel, &NoProgress)
+}
+
+fn scan_discovered_wheel_cache_with_progress(
+    artifacts: &PythonArtifacts,
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     if artifacts.pip_wheel_roots.is_empty() && artifacts.pip_wheel_root_failures.is_empty() {
         return skipped(DET_PIP_WHEEL_CACHE);
     }
@@ -206,7 +256,7 @@ fn scan_discovered_wheel_cache(
             coverage: DetectorCoverage::attempted(DET_PIP_WHEEL_CACHE),
         }
     } else {
-        scan_pip_wheel_cache(&artifacts.pip_wheel_roots, intel)
+        wheel_cache::scan_pip_wheel_cache_with_progress(&artifacts.pip_wheel_roots, intel, progress)
     };
     for (path, status) in &artifacts.pip_wheel_root_failures {
         output.coverage.record_artifact(path.clone(), *status);
@@ -220,6 +270,16 @@ fn scan_files(
     id: DetectorId,
     scan_one: fn(&Path, &EcosystemIntelligence) -> FileScan,
 ) -> DetectorOutput {
+    scan_files_with_progress(paths, intel, id, scan_one, &NoProgress)
+}
+
+fn scan_files_with_progress(
+    paths: &[PathBuf],
+    intel: &EcosystemIntelligence,
+    id: DetectorId,
+    scan_one: fn(&Path, &EcosystemIntelligence) -> FileScan,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     if paths.is_empty() {
         return skipped(id);
     }
@@ -227,6 +287,7 @@ fn scan_files(
     let mut package_evidence = Vec::new();
     let mut coverage = DetectorCoverage::attempted(id);
     for path in paths {
+        progress.tick();
         let result = scan_one(path, intel);
         coverage.record_artifact(path.clone(), result.status);
         findings.extend(result.findings);

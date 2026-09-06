@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkOutcome, walk_matching_files_for_with_progress};
+use crate::discovery::{
+    WalkLimits, WalkOutcome, count_matching_entries_for_limited_with,
+    walk_matching_files_for_with_progress,
+};
 use crate::fsutil::{HostDirKind, classify_host_dir};
 use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
@@ -166,9 +169,12 @@ pub fn discover_python_with_layout_progress(
         classify_python_path(&path, &mut artifacts);
     }
 
+    let install_locs = install_locations.into_inner();
+    progress.add_work(count_dist_info_entries(&install_locs));
+
     let mut dist_info_seen: HashSet<PathBuf> = HashSet::new();
     let mut cap_reached = false;
-    for location in install_locations.into_inner() {
+    for location in install_locs {
         if cap_reached {
             break;
         }
@@ -178,11 +184,14 @@ pub fn discover_python_with_layout_progress(
             &mut dist_info_seen,
             &mut cap_reached,
             &mut artifacts.walk_coverage,
+            progress,
         );
     }
     if cap_reached {
         artifacts.walk_coverage.mark_cap_reached();
     }
+
+    progress.add_work(count_python_scannable_files(&artifacts));
 
     dedup_vec(&mut artifacts.metadata);
     dedup_vec(&mut artifacts.requirements);
@@ -196,6 +205,95 @@ pub fn discover_python_with_layout_progress(
     dedup_vec(&mut artifacts.pdm_locks);
 
     artifacts
+}
+
+pub(crate) fn count_python_walk_entries(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    layout: &PythonHostLayout,
+) -> u32 {
+    let walk_roots = python_walk_roots(scope, config, home, layout);
+    let install_locations: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+    for root in &walk_roots.dirs {
+        if is_package_install_dir(root)
+            && matches!(classify_host_dir(root), HostDirKind::RealDirectory)
+        {
+            let mut locs = install_locations.borrow_mut();
+            if !locs.iter().any(|p| p == root) {
+                locs.push(root.clone());
+            }
+        }
+    }
+    let prune_state = PruneState {
+        install_locations: &install_locations,
+    };
+    count_matching_entries_for_limited_with(
+        walk_roots.dirs,
+        |parent, name| prune_state.prune_dir(parent, name),
+        WalkLimits::production(),
+    )
+}
+
+pub(crate) fn pip_wheel_roots_for_scan(
+    scope: &ScanScope,
+    home: Option<&Path>,
+    config: &ProcessConfig,
+) -> Vec<PathBuf> {
+    collect_pip_wheel_roots(scope, home, config).dirs
+}
+
+pub(crate) fn count_dist_info_entries(locations: &[PathBuf]) -> u64 {
+    let mut ticks = 0u64;
+    let mut metadata = 0u32;
+    for location in locations {
+        let entries = match fs::read_dir(location) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            ticks += 1;
+            if metadata >= DIST_INFO_CAP {
+                return ticks;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".egg-info") || !name.ends_with(".dist-info") {
+                continue;
+            }
+            let meta = path.join("METADATA");
+            if meta.is_file() {
+                metadata += 1;
+            }
+        }
+    }
+    ticks
+}
+
+pub(crate) fn count_python_scannable_files(artifacts: &PythonArtifacts) -> u64 {
+    (artifacts.metadata.len()
+        + artifacts.requirements.len()
+        + artifacts.pyprojects.len()
+        + artifacts.pipfiles.len()
+        + artifacts.setup_cfgs.len()
+        + artifacts.pylock_tomls.len()
+        + artifacts.uv_locks.len()
+        + artifacts.poetry_locks.len()
+        + artifacts.pipfile_locks.len()
+        + artifacts.pdm_locks.len()) as u64
 }
 
 struct WalkRoots {
@@ -293,6 +391,7 @@ fn collect_dist_info_metadata(
     seen: &mut HashSet<PathBuf>,
     cap_reached: &mut bool,
     coverage: &mut DetectorCoverage,
+    progress: &dyn Progress,
 ) {
     let entries = match fs::read_dir(location) {
         Ok(entries) => entries,
@@ -305,6 +404,7 @@ fn collect_dist_info_metadata(
         if *cap_reached {
             return;
         }
+        progress.tick();
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -726,7 +826,7 @@ mod tests {
         let mut seen = HashSet::new();
         let mut cap = false;
         let mut coverage = DetectorCoverage::attempted(DET_DISCOVERY);
-        collect_dist_info_metadata(&site, &mut metadata, &mut seen, &mut cap, &mut coverage);
+        collect_dist_info_metadata(&site, &mut metadata, &mut seen, &mut cap, &mut coverage, &NoProgress);
         let mut restore = std::fs::metadata(&site).unwrap().permissions();
         restore.set_mode(original);
         let _ = std::fs::set_permissions(&site, restore);

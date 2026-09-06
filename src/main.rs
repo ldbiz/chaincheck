@@ -15,7 +15,7 @@ use chaincheck::error::{ProcessExit, StartError};
 use chaincheck::intelligence::load_generic_intelligence_with_progress;
 use chaincheck::progress::{Progress, TerminalProgress};
 use chaincheck::report::{console_brief, write_reports};
-use chaincheck::scan::{ScanScope, scan_with_progress};
+use chaincheck::scan::{ScanScope, ScanWorkPlan, scan_with_progress};
 use chaincheck::self_test;
 
 fn main() -> ExitCode {
@@ -73,6 +73,8 @@ fn run_scan(
     println!("Report:       {}", report_dir.display());
     println!();
     let progress = TerminalProgress::new(progress_enabled(&config));
+    let plan = ScanWorkPlan::estimate_if_live(&scope, &config, home.as_deref(), &progress);
+    progress.begin(plan.total);
     let intelligence = load_generic_intelligence_with_progress(&progress);
     let campaign = CampaignIntelligence::bundled();
     let result = scan_with_progress(
@@ -85,6 +87,7 @@ fn run_scan(
     );
     progress.stage("Writing reports");
     let written = write_reports(&result, &report_dir)?;
+    progress.tick();
     progress.finish();
     print!("{}", console_brief(&result, &written));
     let code = ProcessExit::Scan(result.outcome).exit_code();

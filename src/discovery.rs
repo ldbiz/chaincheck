@@ -54,6 +54,10 @@ impl EntryBudget {
         self.seen += 1;
         true
     }
+
+    pub fn consumed(&self) -> u32 {
+        self.seen
+    }
 }
 
 /// Outcome of a bounded, non-following directory walk.
@@ -233,6 +237,111 @@ pub fn walk_matching_files_for_limited_with_progress(
     }
 
     WalkOutcome { files, coverage }
+}
+
+/// Count directory entries that a bounded matching walk would examine.
+pub(crate) fn count_matching_entries_for_limited_with(
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    mut prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    limits: WalkLimits,
+) -> u32 {
+    let mut stack: Vec<PathBuf> = roots
+        .into_iter()
+        .map(|r| r.as_ref().to_path_buf())
+        .collect();
+    let mut budget = EntryBudget::new(limits.max_entries);
+    let mut exhausted = false;
+
+    'walk: while let Some(dir) = stack.pop() {
+        if exhausted {
+            break;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            if !budget.try_consume() {
+                exhausted = true;
+                break 'walk;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if file_type_is_symlink(file_type, &path) {
+                    continue;
+                }
+                let name = entry.file_name();
+                if prune_dir(&dir, &name) {
+                    continue;
+                }
+                stack.push(path);
+            }
+        }
+    }
+
+    budget.consumed()
+}
+
+/// Count directory entries under `roots` up to `max_entries`.
+pub(crate) fn count_directory_entries_bounded(roots: &[PathBuf], max_entries: u32) -> u32 {
+    let mut budget = EntryBudget::new(max_entries);
+    let mut exhausted = false;
+
+    'roots: for root in roots {
+        if exhausted {
+            break;
+        }
+        match fs::symlink_metadata(root) {
+            Err(_) => continue,
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    continue;
+                }
+            }
+        }
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                if !budget.try_consume() {
+                    exhausted = true;
+                    break 'roots;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    if file_type.is_symlink()
+                        || fs::symlink_metadata(&path)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                }
+            }
+        }
+    }
+
+    budget.consumed()
 }
 
 fn file_type_is_symlink(file_type: FileType, path: &Path) -> bool {

@@ -14,6 +14,7 @@ use crate::model::{EvidenceKind, Severity};
 use crate::processutil::{
     BoundedCommand, LIMIT_GIT_STDOUT, ToolProbe, classify_probe, run_bounded,
 };
+use crate::progress::{NoProgress, Progress};
 use crate::scan::DetectorOutput;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -96,6 +97,14 @@ pub fn findings_from_commits(repo: &Path, commits: &[GitCommit]) -> Vec<Finding>
 /// `git_program`: `None` means Git is treated as unavailable (Skipped), even if
 /// the host actually has Git. `Some("git")` uses the system executable.
 pub fn scan_git(repos: &[PathBuf], git_program: Option<&Path>) -> DetectorOutput {
+    scan_git_with_program(repos, git_program, &NoProgress)
+}
+
+fn scan_git_with_program(
+    repos: &[PathBuf],
+    git_program: Option<&Path>,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     let Some(git_program) = git_program else {
         return DetectorOutput {
             findings: Vec::new(),
@@ -107,6 +116,7 @@ pub fn scan_git(repos: &[PathBuf], git_program: Option<&Path>) -> DetectorOutput
     let mut findings = Vec::new();
     let mut coverage = DetectorCoverage::attempted(DET_GIT_HISTORY);
     for repo in repos {
+        progress.tick();
         let mut cmd = Command::new(git_program);
         cmd.arg("-C")
             .arg(repo)
@@ -151,9 +161,17 @@ fn empty_git(coverage: DetectorCoverage) -> DetectorOutput {
 /// Git has no Unsupported coverage state: only `Missing` is Skipped. Any other
 /// non-successful probe, including [`ToolProbe::Unsupported`], is Partial.
 pub fn scan_git_with_probe(repos: &[PathBuf], probe: ToolProbe) -> DetectorOutput {
+    scan_git_with_progress(repos, probe, &NoProgress)
+}
+
+pub fn scan_git_with_progress(
+    repos: &[PathBuf],
+    probe: ToolProbe,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     match probe {
-        ToolProbe::Present => scan_git(repos, Some(Path::new("git"))),
-        ToolProbe::Missing => scan_git(repos, None),
+        ToolProbe::Present => scan_git_with_program(repos, Some(Path::new("git")), progress),
+        ToolProbe::Missing => scan_git_with_program(repos, None, progress),
         ToolProbe::Failed | ToolProbe::Unsupported => {
             let mut coverage = DetectorCoverage::attempted(DET_GIT_HISTORY);
             coverage.record_artifact(PathBuf::from("git"), ArtifactStatus::Unreadable);

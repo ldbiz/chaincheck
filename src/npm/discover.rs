@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkOutcome, walk_matching_files, walk_matching_files_with_progress};
+use crate::discovery::{
+    WalkLimits, WalkOutcome, count_matching_entries_for_limited_with,
+    walk_matching_files_with_progress,
+};
 use crate::fsutil::{HostDirKind, TextReadOutcome, classify_host_dir, read_utf8_bounded};
 use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
@@ -140,9 +143,49 @@ pub fn discover_npm_with_progress(
         classify_npm_path(path, &mut artifacts);
     }
 
+    progress.add_work(count_npm_scannable_files(&artifacts));
+
     collect_host_cache_roots(home, config.npm_config_cache.as_deref(), &mut artifacts);
     collect_host_npm_logs(home, &mut artifacts);
     artifacts
+}
+
+pub(crate) fn count_npm_walk_entries(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+) -> u32 {
+    let roots = npm_package_roots(scope, config, home);
+    count_matching_entries_for_limited_with(roots.dirs, npm_prune_dir, WalkLimits::production())
+}
+
+pub(crate) fn npm_host_cache_index_roots(
+    home: Option<&Path>,
+    npm_config_cache: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut failures = Vec::new();
+    let mut candidates = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".npm").join("_cacache").join("index-v5"));
+    }
+    if let Some(cache) = npm_config_cache {
+        candidates.push(cache.join("_cacache").join("index-v5"));
+    }
+    for candidate in candidates {
+        consider_host_cache_dir(candidate, &mut roots, &mut failures);
+    }
+    roots
+}
+
+pub(crate) fn count_npm_scannable_files(artifacts: &NpmArtifacts) -> u64 {
+    (artifacts.manifests.len()
+        + artifacts.npm_locks.len()
+        + artifacts.yarn_locks.len()
+        + artifacts.pnpm_locks.len()
+        + artifacts.bun_locks.len()
+        + artifacts.bun_lockb.len()
+        + artifacts.logs.len()) as u64
 }
 
 fn classify_npm_path(path: PathBuf, artifacts: &mut NpmArtifacts) {

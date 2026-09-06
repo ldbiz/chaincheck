@@ -18,11 +18,12 @@ use crate::evidence::Finding;
 use crate::model::{
     CampaignId, EvidenceKind, FindingCode, FindingSubject, IntelligenceSourceId, Severity,
 };
+use crate::progress::{NoProgress, Progress};
 use crate::scan::DetectorOutput;
 
 pub use config::scan_ide_config;
 pub use content::content_ioc_matches;
-pub(crate) use discover::discover_campaign_with_progress;
+pub(crate) use discover::{count_campaign_walk_entries, discover_campaign_with_progress};
 pub use discover::{CampaignArtifacts, discover_campaign};
 pub use intelligence::CampaignIntelligence;
 pub use logs::ioc_findings_from_log_text;
@@ -128,9 +129,27 @@ pub fn scan_campaign_artifacts(
     artifacts: &CampaignArtifacts,
     intel: &CampaignIntelligence,
 ) -> Vec<DetectorOutput> {
+    scan_campaign_artifacts_with_progress(artifacts, intel, &NoProgress)
+}
+
+pub fn scan_campaign_artifacts_with_progress(
+    artifacts: &CampaignArtifacts,
+    intel: &CampaignIntelligence,
+    progress: &dyn Progress,
+) -> Vec<DetectorOutput> {
+    for path in &artifacts.payloads {
+        progress.tick();
+        let _ = path;
+    }
+    let payload = payload::scan_payloads(&artifacts.payloads, intel);
+    for path in &artifacts.ide_configs {
+        progress.tick();
+        let _ = path;
+    }
+    let configs = config::scan_ide_configs(&artifacts.ide_configs);
     vec![
-        payload::scan_payloads(&artifacts.payloads, intel),
-        config::scan_ide_configs(&artifacts.ide_configs),
+        payload,
+        configs,
         DetectorOutput {
             findings: Vec::new(),
             package_evidence: Vec::new(),

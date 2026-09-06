@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
 use crate::intelligence::EcosystemIntelligence;
 use crate::model::PackageIdentity;
+use crate::progress::{NoProgress, Progress};
 use crate::scan::DetectorOutput;
 
 use super::{DET_PIP_WHEEL_CACHE, WHEEL_FILE_CAP, emit_wheel_cache, skipped};
@@ -15,7 +16,21 @@ pub fn scan_pip_wheel_cache(
     roots: &[impl AsRef<Path>],
     intel: &EcosystemIntelligence,
 ) -> DetectorOutput {
-    scan_pip_wheel_cache_limited(roots, intel, WHEEL_FILE_CAP)
+    scan_pip_wheel_cache_with_progress(roots, intel, &NoProgress)
+}
+
+pub fn scan_pip_wheel_cache_with_progress(
+    roots: &[impl AsRef<Path>],
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
+    scan_pip_wheel_cache_bounded_with_progress(
+        roots,
+        intel,
+        WHEEL_FILE_CAP,
+        WalkLimits::production().max_entries,
+        progress,
+    )
 }
 
 pub fn scan_pip_wheel_cache_limited(
@@ -31,6 +46,16 @@ pub(crate) fn scan_pip_wheel_cache_bounded(
     intel: &EcosystemIntelligence,
     cap: u32,
     max_entries: u32,
+) -> DetectorOutput {
+    scan_pip_wheel_cache_bounded_with_progress(roots, intel, cap, max_entries, &NoProgress)
+}
+
+pub(crate) fn scan_pip_wheel_cache_bounded_with_progress(
+    roots: &[impl AsRef<Path>],
+    intel: &EcosystemIntelligence,
+    cap: u32,
+    max_entries: u32,
+    progress: &dyn Progress,
 ) -> DetectorOutput {
     if roots.is_empty() {
         return skipped(DET_PIP_WHEEL_CACHE);
@@ -71,6 +96,7 @@ pub(crate) fn scan_pip_wheel_cache_bounded(
                     truncated_entries = true;
                     break 'roots;
                 }
+                progress.tick();
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {

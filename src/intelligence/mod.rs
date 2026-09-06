@@ -287,8 +287,10 @@ fn load_generic_intelligence_from_with_progress(
 ) -> IntelligenceSnapshot {
     progress.stage("Fetching npm intelligence");
     let npm = fetch_feed_url(npm_url, Ecosystem::Npm, limits);
+    progress.tick();
     progress.stage("Fetching PyPI intelligence");
     let pypi = fetch_feed_url(pypi_url, Ecosystem::Pypi, limits);
+    progress.tick();
     let coverage = vec![
         synthesize_coverage(Ecosystem::Npm, &npm),
         synthesize_coverage(Ecosystem::Pypi, &pypi),

@@ -1,23 +1,27 @@
 //! Scan scope, detector merge, semantic result, and normal-scan exit.
 
+mod plan;
+
 use std::path::{Path, PathBuf};
 
+pub use plan::ScanWorkPlan;
+
 use crate::campaign::{
-    CampaignIntelligence, discover_campaign_with_progress, scan_campaign_artifacts,
+    CampaignIntelligence, discover_campaign_with_progress, scan_campaign_artifacts_with_progress,
 };
 use crate::campaign::{DET_CREDENTIALS, DET_DNS_CACHE, DET_GIT_HISTORY, DET_HOSTS_FILE};
 use crate::cli::ProcessConfig;
 use crate::coverage::DetectorCoverage;
 use crate::credentials::credential_inventory;
 use crate::evidence::{Finding, PackageEvidence};
-use crate::git::{scan_git_with_probe, system_git};
+use crate::git::{scan_git_with_progress, system_git};
 use crate::host::{scan_dns_cache_with_probe, scan_hosts_file, system_resolvectl};
 use crate::intelligence::IntelligenceSnapshot;
 use crate::model::Severity;
-use crate::npm::{apply_npm_corroboration, discover_npm_with_progress, scan_npm_artifacts};
+use crate::npm::{apply_npm_corroboration, discover_npm_with_progress, scan_npm_artifacts_with_progress};
 use crate::progress::{NoProgress, Progress};
 use crate::python::{
-    apply_pypi_corroboration, discover_python_with_progress, scan_python_artifacts,
+    apply_pypi_corroboration, discover_python_with_progress, scan_python_artifacts_with_progress,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,11 +181,18 @@ pub fn scan_with_progress(
     let python_artifacts = discover_python_with_progress(&scope, config, home, progress);
     let campaign_artifacts = discover_campaign_with_progress(&scope, config, home, progress);
     progress.stage("Checking host artefacts");
+    progress.tick();
+    let hosts = scan_hosts_file(Path::new("/etc/hosts"));
+    progress.tick();
+    let dns = scan_dns_cache_with_probe(system_resolvectl());
+    progress.tick();
+    let credentials = credential_inventory(home, std::env::vars_os());
+    let git = scan_git_with_progress(&campaign_artifacts.git_repos, system_git(), progress);
     let host = HostDetectorOutputs {
-        git: scan_git_with_probe(&campaign_artifacts.git_repos, system_git()),
-        hosts: scan_hosts_file(Path::new("/etc/hosts")),
-        dns: scan_dns_cache_with_probe(system_resolvectl()),
-        credentials: credential_inventory(home, std::env::vars_os()),
+        git,
+        hosts,
+        dns,
+        credentials,
     };
     complete_scan(
         scope,
@@ -251,19 +262,27 @@ fn complete_scan(
     progress: &dyn Progress,
 ) -> ScanResult {
     progress.stage("Scanning collected artefacts");
-    let mut outputs = scan_npm_artifacts(&npm_artifacts, &intelligence.npm);
+    let mut outputs = scan_npm_artifacts_with_progress(&npm_artifacts, &intelligence.npm, progress);
     outputs.push(DetectorOutput {
         findings: Vec::new(),
         package_evidence: Vec::new(),
         coverage: npm_artifacts.walk_coverage,
     });
-    outputs.extend(scan_python_artifacts(&python_artifacts, &intelligence.pypi));
+    outputs.extend(scan_python_artifacts_with_progress(
+        &python_artifacts,
+        &intelligence.pypi,
+        progress,
+    ));
     outputs.push(DetectorOutput {
         findings: Vec::new(),
         package_evidence: Vec::new(),
         coverage: python_artifacts.walk_coverage,
     });
-    outputs.extend(scan_campaign_artifacts(&campaign_artifacts, campaign));
+    outputs.extend(scan_campaign_artifacts_with_progress(
+        &campaign_artifacts,
+        campaign,
+        progress,
+    ));
     outputs.push(host.git);
     outputs.push(host.hosts);
     outputs.push(host.dns);

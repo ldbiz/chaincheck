@@ -10,6 +10,7 @@ use crate::evidence::EvidenceClass;
 use crate::fsutil::{read_text_lossy_bounded, text_artifact_status};
 use crate::intelligence::EcosystemIntelligence;
 use crate::model::{EvidenceKind, Severity};
+use crate::progress::{NoProgress, Progress};
 use crate::scan::DetectorOutput;
 
 use crate::campaign::ioc_findings_from_log_text;
@@ -35,10 +36,19 @@ static INSTALL_CONTEXT: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 pub fn scan_npm_logs(paths: &[impl AsRef<Path>], intel: &EcosystemIntelligence) -> DetectorOutput {
+    scan_npm_logs_with_progress(paths, intel, &NoProgress)
+}
+
+pub fn scan_npm_logs_with_progress(
+    paths: &[impl AsRef<Path>],
+    intel: &EcosystemIntelligence,
+    progress: &dyn Progress,
+) -> DetectorOutput {
     let mut findings = Vec::new();
     let mut evidence = Vec::new();
     let mut coverage = DetectorCoverage::attempted(DET_NPM_LOGS);
     for path in paths {
+        progress.tick();
         let path = path.as_ref();
         match read_text_lossy_bounded(path, LIMIT_NPM_LOG) {
             crate::fsutil::TextReadOutcome::Text(text) => {
