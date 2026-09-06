@@ -22,4 +22,3 @@ pub mod python;
 pub mod report;
 pub mod scan;
 pub mod self_test;
-pub mod walk_estimate;

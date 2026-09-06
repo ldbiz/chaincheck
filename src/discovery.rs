@@ -8,7 +8,7 @@ use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 
 use crate::coverage::{ArtifactStatus, DetectorCoverage, DetectorId};
-use crate::progress::{NoProgress, Progress, WalkTick};
+use crate::progress::{NoProgress, Progress};
 
 pub const DET_FILESYSTEM_WALK: DetectorId = DetectorId::from_static("filesystem-walk");
 
@@ -179,18 +179,12 @@ pub fn walk_matching_files_for_limited_with_progress(
                 continue;
             }
         };
-        let mut entries_in_dir = 0u32;
         for entry in entries {
             if !budget.try_consume() {
                 exhausted = Some("directory entries");
                 break 'walk;
             }
-            entries_in_dir = entries_in_dir.saturating_add(1);
-            progress.tick_walk(WalkTick {
-                pending_dirs: u32::try_from(stack.len()).unwrap_or(u32::MAX),
-                entries_in_current_dir: entries_in_dir,
-                directory_finished: false,
-            });
+            progress.tick();
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -226,11 +220,6 @@ pub fn walk_matching_files_for_limited_with_progress(
                 }
             }
         }
-        progress.tick_walk(WalkTick {
-            pending_dirs: u32::try_from(stack.len()).unwrap_or(u32::MAX),
-            entries_in_current_dir: entries_in_dir,
-            directory_finished: true,
-        });
     }
 
     if let Some(kind) = exhausted {
@@ -492,48 +481,6 @@ mod tests {
             walk_matching_files_with_progress([&root], |_p, _n| false, |_p, _n| true, &progress);
         assert_eq!(walked.files.len(), 3, "{:?}", walked.files);
         assert_eq!(progress.tick_count(), 4);
-        cleanup(&root);
-    }
-
-    #[test]
-    fn walk_phase_ticks_during_approximate_progress() {
-        let root = tmp();
-        fs::write(root.join("keep.dat"), b"k").unwrap();
-        let progress = CountingProgress::new();
-        progress.begin_walk_phase("Walking filesystem (npm)", 10);
-        let walked = walk_matching_files_with_progress(
-            [&root],
-            |_p, _n| false,
-            |_p, name| name == "keep.dat",
-            &progress,
-        );
-        progress.end_walk_phase();
-        assert_eq!(walked.files.len(), 1);
-        assert_eq!(progress.tick_count(), 1);
-        assert_eq!(progress.display_percents().last(), Some(&100));
-        cleanup(&root);
-    }
-
-    #[test]
-    fn walk_refines_estimate_from_real_observations() {
-        let root = tmp();
-        for i in 0..80 {
-            fs::write(root.join(format!("f{i}.dat")), b"n").unwrap();
-        }
-        fs::create_dir_all(root.join("sub")).unwrap();
-        fs::write(root.join("sub/g.dat"), b"g").unwrap();
-        let progress = CountingProgress::new();
-        progress.begin_walk_phase("Walking filesystem (npm)", 8);
-        let initial = progress.latest_estimate();
-        let walked =
-            walk_matching_files_with_progress([&root], |_p, _n| false, |_p, _n| true, &progress);
-        assert!(walked.files.len() > 8);
-        assert!(progress.latest_estimate() >= initial);
-        assert!(progress.tick_count() >= 80);
-        let percents = progress.display_percents();
-        assert!(percents.windows(2).all(|w| w[0] <= w[1]));
-        progress.end_walk_phase();
-        assert_eq!(progress.display_percents().last(), Some(&100));
         cleanup(&root);
     }
 }

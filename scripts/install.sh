@@ -62,10 +62,16 @@ fi
 mkdir -p "$BIN_DIR"
 install -m 755 "$src/target/release/chaincheck" "$BIN_DIR/chaincheck"
 
-echo "Installed $BIN_DIR/chaincheck"
-case ":$PATH:" in
-  *:"$BIN_DIR":*) ;;
-  *)
-    echo "Note: $BIN_DIR is not on PATH. Add it yourself or invoke $BIN_DIR/chaincheck by path."
-    ;;
-esac
+installed="$BIN_DIR/chaincheck"
+echo "Installed $installed"
+on_path=$(command -v chaincheck 2>/dev/null || true)
+if [[ -z "$on_path" ]]; then
+  echo "Note: $BIN_DIR is not on PATH. Add it yourself or invoke $installed by path."
+else
+  installed_res=$(cd "$(dirname "$installed")" && pwd)/$(basename "$installed")
+  on_path_res=$(cd "$(dirname "$on_path")" && pwd)/$(basename "$on_path")
+  if [[ "$on_path_res" != "$installed_res" ]]; then
+    echo "Note: 'chaincheck' currently resolves to $on_path, not the binary just installed."
+    echo "      Invoke $installed by path, or remove the earlier copy."
+  fi
+fi

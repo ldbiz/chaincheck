@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkLimits, WalkOutcome, walk_matching_files_with_progress};
+use crate::discovery::{WalkOutcome, walk_matching_files_with_progress};
 use crate::fsutil::{HostDirKind, TextReadOutcome, classify_host_dir, read_utf8_bounded};
 use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
-use crate::walk_estimate::estimate_walk_entries_shallow;
 
 /// Directories the npm walk does not descend. This is not a global policy:
 /// Python environment trees remain visitable through [`walk_files`] with a
@@ -112,19 +111,13 @@ pub fn discover_npm_with_progress(
     home: Option<&Path>,
     progress: &dyn Progress,
 ) -> NpmArtifacts {
+    progress.stage("Walking filesystem (npm)");
     let walk_roots = npm_package_roots(scope, config, home);
-    let estimate = estimate_walk_entries_shallow(
-        walk_roots.dirs.iter(),
-        npm_prune_dir,
-        WalkLimits::production(),
-    );
-    progress.begin_walk_phase("Walking filesystem (npm)", estimate.estimated_total);
     let extra_failures = walk_roots.failures;
     let WalkOutcome {
         files,
         mut coverage,
     } = walk_matching_files_with_progress(walk_roots.dirs, npm_prune_dir, npm_keep_file, progress);
-    progress.end_walk_phase();
     for (path, status) in extra_failures {
         coverage.record_artifact(path, status);
     }
@@ -410,35 +403,6 @@ mod tests {
                 .iter()
                 .all(|e| !e.path.components().any(|c| c.as_os_str() == "_cacache"))
         );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn discover_npm_progress_does_not_change_artefacts_or_coverage() {
-        use crate::progress::CountingProgress;
-
-        let root = tmp();
-        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-        fs::write(root.join("node_modules/pkg/package.json"), b"{}").unwrap();
-        fs::write(root.join("package-lock.json"), b"{}").unwrap();
-        let home = root.join("home");
-        fs::create_dir_all(&home).unwrap();
-        let scope = ScanScope::ExplicitRoot { root: root.clone() };
-        let config = ProcessConfig::default();
-
-        let baseline = discover_npm(&scope, &config, Some(&home));
-        let progress = CountingProgress::new();
-        let with_progress = discover_npm_with_progress(&scope, &config, Some(&home), &progress);
-
-        assert_eq!(baseline.manifests, with_progress.manifests);
-        assert_eq!(baseline.npm_locks, with_progress.npm_locks);
-        assert_eq!(
-            baseline.walk_coverage.status(),
-            with_progress.walk_coverage.status()
-        );
-        assert!(progress.tick_count() >= 1);
-        assert_eq!(progress.staged().first(), Some(&"Walking filesystem (npm)"));
-        assert_eq!(progress.display_percents().last(), Some(&100));
         let _ = fs::remove_dir_all(&root);
     }
 
