@@ -15,6 +15,7 @@ name = "chaincheck"
 path = "src/main.rs"
 
 [dependencies]
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"] }
 jsonc-parser = { version = "0.33.1", default-features = false, features = ["serde"] }
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -27,6 +27,7 @@ use crate::model::{
 use crate::scan::{DetectorOutput, ScanResult, ScanScope, merge_outputs};
 
 pub use cache::scan_npm_cache;
+pub(crate) use discover::discover_npm_with_progress;
 pub use discover::{NpmArtifacts, PackageRoots, discover_npm, npm_package_roots, npm_prune_dir};
 pub use logs::scan_npm_logs;
 

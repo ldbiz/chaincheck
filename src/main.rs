@@ -12,9 +12,10 @@ use chaincheck::cli::{
     resolve_report_dir,
 };
 use chaincheck::error::{ProcessExit, StartError};
-use chaincheck::intelligence::load_generic_intelligence;
+use chaincheck::intelligence::load_generic_intelligence_with_progress;
+use chaincheck::progress::{Progress, TerminalProgress};
 use chaincheck::report::{console_brief, write_reports};
-use chaincheck::scan::{ScanScope, scan};
+use chaincheck::scan::{ScanScope, scan_with_progress};
 use chaincheck::self_test;
 
 fn main() -> ExitCode {
@@ -71,20 +72,20 @@ fn run_scan(
     println!("Primary root: {}", primary_root(&scope));
     println!("Report:       {}", report_dir.display());
     println!();
-    let progress = progress_enabled(&config);
-    if progress {
-        eprintln!("Acquiring malware intelligence…");
-    }
-    let intelligence = load_generic_intelligence();
-    if progress {
-        eprintln!("Scanning…");
-    }
+    let progress = TerminalProgress::new(progress_enabled(&config));
+    let intelligence = load_generic_intelligence_with_progress(&progress);
     let campaign = CampaignIntelligence::bundled();
-    let result = scan(scope, &config, home.as_deref(), intelligence, &campaign);
-    if progress {
-        eprintln!("Writing reports…");
-    }
+    let result = scan_with_progress(
+        scope,
+        &config,
+        home.as_deref(),
+        intelligence,
+        &campaign,
+        &progress,
+    );
+    progress.stage("Writing reports");
     let written = write_reports(&result, &report_dir)?;
+    progress.finish();
     print!("{}", console_brief(&result, &written));
     let code = ProcessExit::Scan(result.outcome).exit_code();
     println!("Scan exit code: {code}");

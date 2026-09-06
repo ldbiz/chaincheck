@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::DetectorCoverage;
-use crate::discovery::{WalkOutcome, walk_matching_files_for};
+use crate::discovery::{WalkOutcome, walk_matching_files_for_with_progress};
 use crate::npm::npm_package_roots;
+use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
 
 use super::DET_CAMPAIGN_WALK;
@@ -59,12 +60,22 @@ pub fn discover_campaign(
     config: &ProcessConfig,
     home: Option<&Path>,
 ) -> CampaignArtifacts {
+    discover_campaign_with_progress(scope, config, home, &NoProgress)
+}
+
+pub fn discover_campaign_with_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    progress: &dyn Progress,
+) -> CampaignArtifacts {
+    progress.stage("Walking filesystem (campaign)");
     let roots = npm_package_roots(scope, config, home);
     let mut git_repos = Vec::new();
     let WalkOutcome {
         files,
         mut coverage,
-    } = walk_matching_files_for(
+    } = walk_matching_files_for_with_progress(
         DET_CAMPAIGN_WALK,
         roots.dirs,
         |parent, name| {
@@ -77,6 +88,7 @@ pub fn discover_campaign(
             campaign_prune_dir(parent, name)
         },
         campaign_keep_file,
+        progress,
     );
 
     for (path, status) in roots.failures {

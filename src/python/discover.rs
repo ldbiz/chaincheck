@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkOutcome, walk_matching_files_for};
+use crate::discovery::{WalkOutcome, walk_matching_files_for_with_progress};
 use crate::fsutil::{HostDirKind, classify_host_dir};
+use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
 
 use super::{DET_DISCOVERY, DIST_INFO_CAP};
@@ -81,12 +82,33 @@ pub fn discover_python(
     discover_python_with_layout(scope, config, home, &layout)
 }
 
+pub fn discover_python_with_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    progress: &dyn Progress,
+) -> PythonArtifacts {
+    let layout = PythonHostLayout::production(config);
+    discover_python_with_layout_progress(scope, config, home, &layout, progress)
+}
+
 pub fn discover_python_with_layout(
     scope: &ScanScope,
     config: &ProcessConfig,
     home: Option<&Path>,
     layout: &PythonHostLayout,
 ) -> PythonArtifacts {
+    discover_python_with_layout_progress(scope, config, home, layout, &NoProgress)
+}
+
+pub fn discover_python_with_layout_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    layout: &PythonHostLayout,
+    progress: &dyn Progress,
+) -> PythonArtifacts {
+    progress.stage("Walking filesystem (Python)");
     let walk_roots = python_walk_roots(scope, config, home, layout);
     let pip_wheel = collect_pip_wheel_roots(scope, home, config);
     let install_locations: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -107,11 +129,12 @@ pub fn discover_python_with_layout(
     let WalkOutcome {
         files,
         mut coverage,
-    } = walk_matching_files_for(
+    } = walk_matching_files_for_with_progress(
         DET_DISCOVERY,
         walk_roots.dirs.clone(),
         |parent, name| prune_state.prune_dir(parent, name),
         python_keep_file,
+        progress,
     );
 
     for (path, status) in &walk_roots.failures {
