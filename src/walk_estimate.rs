@@ -1,21 +1,31 @@
-//! Shallow filesystem sampling for approximate walk progress only.
+//! Bounded adaptive sampling for approximate walk progress only.
 //!
 //! This module never affects scan findings, coverage, or exit codes.
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs::{self, FileType};
+use std::fs::{self, FileType, ReadDir};
 use std::path::{Path, PathBuf};
 
 use crate::discovery::WalkLimits;
 
-/// Maximum directory entries examined by the shallow estimator.
-pub const SHALLOW_ESTIMATE_MAX_ENTRIES: u32 = 512;
+/// First sample, and size of each extra tranche.
+pub const SHALLOW_ESTIMATE_TRANCHE_ENTRIES: u32 = 512;
 
-/// Maximum directory depth descended by the shallow estimator (roots at depth 0).
-pub const SHALLOW_ESTIMATE_MAX_DEPTH: u32 = 4;
+/// Absolute cap on unique directory entries examined by the estimator.
+pub const SHALLOW_ESTIMATE_HARD_CEILING: u32 = 8_192;
 
-/// Outcome of a bounded shallow sample. UX-only; not evidence.
+/// Maximum depth for the initial shallow tranche (roots at depth 0).
+pub const SHALLOW_ESTIMATE_INITIAL_MAX_DEPTH: u32 = 4;
+
+/// Hard maximum depth for later targeted sampling.
+pub const SHALLOW_ESTIMATE_HARD_MAX_DEPTH: u32 = 8;
+
+const SMALL_UNRESOLVED: usize = 2;
+const LARGE_UNRESOLVED: usize = 8;
+const PROMOTE_PER_TRANCHE: usize = 32;
+
+/// Outcome of a bounded sample. UX-only; not evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalkEntryEstimate {
     pub sample_entries: u32,
@@ -23,94 +33,282 @@ pub struct WalkEntryEstimate {
     pub truncated: bool,
 }
 
-/// Sample scan roots with the same prune predicate as the corresponding real walk.
-///
-/// Breadth-first and strictly bounded. Never reads file contents. On any failure,
-/// returns a conservative estimate derived from whatever sample completed.
-pub fn estimate_walk_entries_shallow(
-    roots: impl IntoIterator<Item = impl AsRef<Path>>,
-    mut prune_dir: impl FnMut(&Path, &OsStr) -> bool,
-    limits: WalkLimits,
-) -> WalkEntryEstimate {
-    let mut queue: VecDeque<(PathBuf, u32)> = roots
-        .into_iter()
-        .map(|r| (r.as_ref().to_path_buf(), 0))
-        .collect();
-    let mut sample_entries = 0u32;
-    let mut dirs_opened = 0u32;
-    let mut frontier = 0u32;
-    let mut truncated = false;
-    let mut unfinished_directory = false;
+struct OpenDir {
+    parent: PathBuf,
+    depth: u32,
+    iter: ReadDir,
+}
 
-    'sample: while let Some((dir, depth)) = queue.pop_front() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        dirs_opened += 1;
-        for entry in entries {
-            if sample_entries >= SHALLOW_ESTIMATE_MAX_ENTRIES {
-                truncated = true;
-                unfinished_directory = true;
-                break 'sample;
-            }
-            sample_entries += 1;
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            if is_symlink_dir(file_type, &path) {
-                continue;
-            }
-            let name = entry.file_name();
-            if prune_dir(&dir, &name) {
-                continue;
-            }
-            if depth >= SHALLOW_ESTIMATE_MAX_DEPTH {
-                truncated = true;
-                frontier = frontier.saturating_add(1);
-                continue;
-            }
-            queue.push_back((path, depth + 1));
+struct Sampler<F> {
+    prune: F,
+    queue: VecDeque<(PathBuf, u32)>,
+    open: Option<OpenDir>,
+    depth_frontier: VecDeque<(PathBuf, u32)>,
+    allowed_depth: u32,
+    hard_max_depth: u32,
+    sample_entries: u32,
+    dirs_opened: u32,
+}
+
+impl<F: FnMut(&Path, &OsStr) -> bool> Sampler<F> {
+    fn new(
+        roots: impl IntoIterator<Item = impl AsRef<Path>>,
+        prune: F,
+        initial_depth: u32,
+    ) -> Self {
+        Self {
+            prune,
+            queue: roots
+                .into_iter()
+                .map(|r| (r.as_ref().to_path_buf(), 0))
+                .collect(),
+            open: None,
+            depth_frontier: VecDeque::new(),
+            allowed_depth: initial_depth,
+            hard_max_depth: initial_depth,
+            sample_entries: 0,
+            dirs_opened: 0,
         }
     }
 
-    if unfinished_directory {
-        frontier = frontier
-            .saturating_add(1)
-            .saturating_add(u32::try_from(queue.len()).unwrap_or(u32::MAX));
-    } else {
-        frontier = frontier.saturating_add(u32::try_from(queue.len()).unwrap_or(u32::MAX));
-        if !queue.is_empty() {
-            truncated = true;
-        }
+    fn is_complete(&self) -> bool {
+        self.open.is_none() && self.queue.is_empty() && self.depth_frontier.is_empty()
     }
 
-    let estimated_total = if truncated {
+    fn has_promotable_frontier(&self) -> bool {
+        self.depth_frontier
+            .iter()
+            .any(|(_, depth)| *depth <= self.hard_max_depth)
+    }
+
+    fn unresolved_count(&self) -> usize {
+        let mut n = self.queue.len();
+        if self.open.is_some() {
+            n = n.saturating_add(1);
+        }
+        n.saturating_add(
+            self.depth_frontier
+                .iter()
+                .filter(|(_, depth)| *depth <= self.hard_max_depth)
+                .count(),
+        )
+    }
+
+    fn unresolved_large(&self) -> bool {
+        self.open.is_some()
+            || self.has_promotable_frontier()
+            || self.queue.len() >= LARGE_UNRESOLVED
+    }
+
+    fn remaining_unknown_small(&self, estimate: u64) -> bool {
+        if self.open.is_some() || !self.queue.is_empty() || self.has_promotable_frontier() {
+            return false;
+        }
+        if self.unresolved_count() > SMALL_UNRESOLVED {
+            return false;
+        }
+        let sample = u64::from(self.sample_entries.max(1));
+        estimate <= sample.saturating_mul(3) / 2
+    }
+
+    fn frontier_work(&self) -> u32 {
+        let mut n = u32::try_from(self.queue.len().saturating_add(self.depth_frontier.len()))
+            .unwrap_or(u32::MAX);
+        if self.open.is_some() {
+            n = n.saturating_add(1);
+        }
+        n
+    }
+
+    fn estimate(&self, limits: WalkLimits) -> u64 {
+        if self.is_complete() {
+            return u64::from(self.sample_entries.max(1));
+        }
         extrapolate(
-            sample_entries,
-            dirs_opened,
-            frontier,
-            unfinished_directory,
+            self.sample_entries,
+            self.dirs_opened,
+            self.frontier_work(),
+            self.open.is_some(),
             limits,
         )
-    } else {
-        u64::from(sample_entries.max(1))
-    };
+    }
 
+    fn prepare_tranche(&mut self) {
+        if self.open.is_some() || !self.queue.is_empty() {
+            return;
+        }
+        if !self.has_promotable_frontier() {
+            return;
+        }
+        self.allowed_depth = self.hard_max_depth;
+        let mut rest = VecDeque::new();
+        let mut promoted = 0usize;
+        while let Some((path, depth)) = self.depth_frontier.pop_front() {
+            if depth <= self.hard_max_depth && promoted < PROMOTE_PER_TRANCHE {
+                self.queue.push_back((path, depth));
+                promoted += 1;
+            } else {
+                rest.push_back((path, depth));
+            }
+        }
+        self.depth_frontier = rest;
+    }
+
+    fn consume_entries(&mut self, budget: u32, ceiling: u32) {
+        let stop_at = self.sample_entries.saturating_add(budget).min(ceiling);
+        while self.sample_entries < stop_at {
+            if !self.step_one() {
+                break;
+            }
+        }
+    }
+
+    fn step_one(&mut self) -> bool {
+        if let Some(mut open) = self.open.take() {
+            match open.iter.next() {
+                None => true,
+                Some(entry) => {
+                    self.sample_entries = self.sample_entries.saturating_add(1);
+                    if let Ok(entry) = entry {
+                        self.consider_entry(&open.parent, open.depth, &entry);
+                    }
+                    self.open = Some(open);
+                    true
+                }
+            }
+        } else if let Some((dir, depth)) = self.queue.pop_front() {
+            match fs::read_dir(&dir) {
+                Ok(iter) => {
+                    self.dirs_opened = self.dirs_opened.saturating_add(1);
+                    self.open = Some(OpenDir {
+                        parent: dir,
+                        depth,
+                        iter,
+                    });
+                    true
+                }
+                Err(_) => true,
+            }
+        } else {
+            false
+        }
+    }
+
+    fn consider_entry(&mut self, parent: &Path, parent_depth: u32, entry: &fs::DirEntry) {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => return,
+        };
+        if !file_type.is_dir() {
+            return;
+        }
+        if is_symlink_dir(file_type, &path) {
+            return;
+        }
+        let name = entry.file_name();
+        if (self.prune)(parent, &name) {
+            return;
+        }
+        let child_depth = parent_depth.saturating_add(1);
+        if parent_depth >= self.allowed_depth {
+            self.depth_frontier.push_back((path, child_depth));
+            return;
+        }
+        self.queue.push_back((path, child_depth));
+    }
+}
+
+/// Sample scan roots with the same prune predicate as the corresponding real walk.
+///
+/// Adaptive, resumable, and strictly bounded. Never reads file contents. On any
+/// failure, returns a conservative estimate derived from whatever sample completed.
+pub fn estimate_walk_entries_shallow(
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    limits: WalkLimits,
+) -> WalkEntryEstimate {
+    estimate_with_config(roots, prune_dir, limits, SampleConfig::production())
+}
+
+#[derive(Clone, Copy)]
+struct SampleConfig {
+    tranche_entries: u32,
+    hard_ceiling: u32,
+    initial_max_depth: u32,
+    hard_max_depth: u32,
+}
+
+impl SampleConfig {
+    fn production() -> Self {
+        Self {
+            tranche_entries: SHALLOW_ESTIMATE_TRANCHE_ENTRIES,
+            hard_ceiling: SHALLOW_ESTIMATE_HARD_CEILING,
+            initial_max_depth: SHALLOW_ESTIMATE_INITIAL_MAX_DEPTH,
+            hard_max_depth: SHALLOW_ESTIMATE_HARD_MAX_DEPTH,
+        }
+    }
+}
+
+fn estimate_with_config(
+    roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    prune_dir: impl FnMut(&Path, &OsStr) -> bool,
+    limits: WalkLimits,
+    cfg: SampleConfig,
+) -> WalkEntryEstimate {
+    let mut sampler = Sampler::new(roots, prune_dir, cfg.initial_max_depth);
+    sampler.hard_max_depth = cfg.hard_max_depth;
+    let mut prev_estimate: Option<u64> = None;
+    let mut tranches = 0u32;
+
+    loop {
+        if sampler.sample_entries >= cfg.hard_ceiling {
+            break;
+        }
+        let current = sampler.estimate(limits);
+        if sampler.is_complete() {
+            break;
+        }
+        if sampler.remaining_unknown_small(current) {
+            break;
+        }
+        if tranches >= 1 && !sampler.unresolved_large() && estimate_close(prev_estimate, current) {
+            break;
+        }
+        sampler.prepare_tranche();
+        let before = sampler.sample_entries;
+        sampler.consume_entries(cfg.tranche_entries, cfg.hard_ceiling);
+        tranches = tranches.saturating_add(1);
+        prev_estimate = Some(sampler.estimate(limits));
+        if sampler.sample_entries == before
+            && sampler.open.is_none()
+            && sampler.queue.is_empty()
+            && !sampler.has_promotable_frontier()
+        {
+            break;
+        }
+    }
+
+    let truncated = !sampler.is_complete();
+    let estimated_total = if truncated {
+        sampler.estimate(limits)
+    } else {
+        u64::from(sampler.sample_entries.max(1))
+    };
     WalkEntryEstimate {
-        sample_entries,
+        sample_entries: sampler.sample_entries,
         estimated_total,
         truncated,
     }
+}
+
+fn estimate_close(previous: Option<u64>, current: u64) -> bool {
+    let Some(prev) = previous else {
+        return false;
+    };
+    let base = prev.max(1);
+    let delta = current.abs_diff(prev);
+    delta.saturating_mul(5) < base
 }
 
 fn extrapolate(
@@ -167,40 +365,29 @@ mod tests {
         path
     }
 
-    #[test]
-    fn respects_entry_budget_constant() {
-        let root = tmp();
-        for i in 0..800 {
-            fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
-        }
-        let estimate =
-            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert_eq!(estimate.sample_entries, SHALLOW_ESTIMATE_MAX_ENTRIES);
-        assert!(estimate.truncated);
-        assert!(estimate.estimated_total >= u64::from(SHALLOW_ESTIMATE_MAX_ENTRIES));
-        let _ = fs::remove_dir_all(&root);
+    fn estimate_capped(root: &Path, ceiling: u32, hard_max_depth: u32) -> WalkEntryEstimate {
+        estimate_with_config(
+            [root],
+            |_p, _n| false,
+            WalkLimits::production(),
+            SampleConfig {
+                tranche_entries: SHALLOW_ESTIMATE_TRANCHE_ENTRIES,
+                hard_ceiling: ceiling,
+                initial_max_depth: SHALLOW_ESTIMATE_INITIAL_MAX_DEPTH,
+                hard_max_depth,
+            },
+        )
     }
 
     #[test]
-    fn does_not_traverse_entire_large_tree() {
-        let root = tmp();
-        for i in 0..800 {
-            fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
-        }
-        let estimate =
-            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert!(estimate.sample_entries < 800);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn small_tree_estimate_matches_sample() {
+    fn small_tree_stops_cheaply() {
         let root = tmp();
         fs::create_dir_all(root.join("a/b")).unwrap();
         fs::write(root.join("a/b/package.json"), b"{}").unwrap();
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
         assert!(!estimate.truncated);
+        assert!(estimate.sample_entries < SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
         assert_eq!(
             estimate.estimated_total,
             u64::from(estimate.sample_entries.max(1))
@@ -209,16 +396,47 @@ mod tests {
     }
 
     #[test]
-    fn respects_depth_budget_constant() {
+    fn large_uncertain_tree_samples_beyond_first_tranche() {
         let root = tmp();
-        let mut current = root.clone();
-        for i in 0..=SHALLOW_ESTIMATE_MAX_DEPTH + 2 {
-            current = current.join(format!("d{i}"));
-            fs::create_dir_all(&current).unwrap();
+        for i in 0..1_200 {
+            fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+            fs::write(root.join(format!("d{i}/f.dat")), b"n").unwrap();
         }
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_MAX_ENTRIES);
+        assert!(estimate.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
+        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_HARD_CEILING);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sampling_resumes_without_recounting_consumed_entries() {
+        let root = tmp();
+        for i in 0..900 {
+            fs::write(root.join(format!("f{i}.dat")), b"n").unwrap();
+        }
+        let estimate =
+            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(!estimate.truncated);
+        assert_eq!(estimate.sample_entries, 900);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_ceiling_always_wins_on_huge_tree() {
+        let root = tmp();
+        for i in 0..20_000 {
+            fs::write(root.join(format!("f{i}.dat")), b"n").unwrap();
+        }
+        let estimate =
+            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(estimate.truncated);
+        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_HARD_CEILING);
+        assert!(estimate.sample_entries < 20_000);
+        assert!(
+            estimate.estimated_total > u64::from(estimate.sample_entries),
+            "{estimate:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -226,43 +444,65 @@ mod tests {
     fn depth_cutoff_is_incomplete_for_narrow_deep_tree() {
         let root = tmp();
         let mut current = root.clone();
-        for i in 0..SHALLOW_ESTIMATE_MAX_DEPTH + 8 {
+        for i in 0..SHALLOW_ESTIMATE_HARD_MAX_DEPTH + 8 {
             current = current.join(format!("d{i}"));
             fs::create_dir_all(&current).unwrap();
             fs::write(current.join("leaf.txt"), b"x").unwrap();
         }
+        let shallow = estimate_capped(&root, SHALLOW_ESTIMATE_HARD_CEILING, 4);
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
         assert!(
             estimate.truncated,
-            "depth cutoff must mark the sample incomplete"
+            "depth-limited remainder must not count as a complete sample: {estimate:?}"
         );
         assert!(
             estimate.estimated_total > u64::from(estimate.sample_entries),
-            "deep unsampled content must not be treated as a complete tiny tree: {estimate:?}"
+            "{estimate:?}"
+        );
+        assert!(
+            estimate.sample_entries > shallow.sample_entries
+                || estimate.estimated_total >= shallow.estimated_total,
+            "later tranches should gain deeper information: full={estimate:?} shallow={shallow:?}"
+        );
+        assert!(
+            estimate.sample_entries < 80,
+            "must not restart and re-enumerate ancestors: {estimate:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn wide_file_only_directory_is_incomplete() {
+    fn adaptive_later_sampling_inspects_depth_frontier() {
+        let root = tmp();
+        let mut current = root.clone();
+        for i in 0..SHALLOW_ESTIMATE_HARD_MAX_DEPTH + 3 {
+            current = current.join(format!("n{i}"));
+            fs::create_dir_all(&current).unwrap();
+            fs::write(current.join(format!("m{i}.txt")), b"x").unwrap();
+        }
+        let depth4_only = estimate_capped(&root, 64, 4);
+        let deeper = estimate_capped(&root, 64, SHALLOW_ESTIMATE_HARD_MAX_DEPTH);
+        assert!(deeper.sample_entries > depth4_only.sample_entries);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wide_file_only_directory_is_incomplete_until_known() {
         let root = tmp();
         for i in 0..4_000 {
             fs::write(root.join(format!("f{i}.dat")), b"n").unwrap();
         }
-        let estimate =
-            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert_eq!(estimate.sample_entries, SHALLOW_ESTIMATE_MAX_ENTRIES);
-        assert!(estimate.truncated);
-        assert!(
-            estimate.estimated_total > u64::from(SHALLOW_ESTIMATE_MAX_ENTRIES),
-            "unfinished wide directory must not look like a complete 512-entry tree: {estimate:?}"
-        );
+        let partial = estimate_capped(&root, SHALLOW_ESTIMATE_TRANCHE_ENTRIES, 4);
+        assert!(partial.truncated);
+        assert!(partial.estimated_total > u64::from(partial.sample_entries));
+        let full = estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(full.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn wide_directory_tree_is_incomplete_and_not_tiny() {
+    fn wide_directory_tree_samples_past_initial_tranche() {
         let root = tmp();
         for i in 0..400 {
             let dir = root.join(format!("d{i}"));
@@ -273,17 +513,13 @@ mod tests {
         }
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert!(estimate.truncated);
-        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_MAX_ENTRIES);
-        assert!(
-            estimate.estimated_total > u64::from(estimate.sample_entries),
-            "{estimate:?}"
-        );
+        assert!(estimate.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
+        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_HARD_CEILING);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn mixed_broad_and_deep_tree_is_incomplete() {
+    fn mixed_broad_and_deep_tree_is_incomplete_or_larger_than_first_tranche() {
         let root = tmp();
         for i in 0..40 {
             fs::create_dir_all(root.join(format!("wide{i}"))).unwrap();
@@ -291,15 +527,54 @@ mod tests {
         }
         let mut deep = root.join("deep");
         fs::create_dir_all(&deep).unwrap();
-        for i in 0..SHALLOW_ESTIMATE_MAX_DEPTH + 6 {
+        for i in 0..SHALLOW_ESTIMATE_HARD_MAX_DEPTH + 6 {
             deep = deep.join(format!("n{i}"));
             fs::create_dir_all(&deep).unwrap();
             fs::write(deep.join("x.txt"), b"x").unwrap();
         }
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
-        assert!(estimate.truncated);
-        assert!(estimate.estimated_total > u64::from(estimate.sample_entries.max(1)));
+        assert!(
+            estimate.truncated || estimate.sample_entries > SHALLOW_ESTIMATE_INITIAL_MAX_DEPTH * 4
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn false_stability_does_not_stop_while_depth_frontier_remains() {
+        let root = tmp();
+        for i in 0..80 {
+            let mut current = root.join(format!("b{i}"));
+            fs::create_dir_all(&current).unwrap();
+            for d in 0..SHALLOW_ESTIMATE_HARD_MAX_DEPTH + 2 {
+                current = current.join(format!("d{d}"));
+                fs::create_dir_all(&current).unwrap();
+                fs::write(current.join("x.txt"), b"x").unwrap();
+            }
+        }
+        let estimate =
+            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(estimate.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
+        assert!(
+            estimate.truncated || estimate.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES * 2
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn additional_tranches_reach_diminishing_value_on_modest_tree() {
+        let root = tmp();
+        for i in 0..60 {
+            fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+            fs::write(root.join(format!("d{i}/a.txt")), b"a").unwrap();
+        }
+        let estimate =
+            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(estimate.sample_entries < SHALLOW_ESTIMATE_HARD_CEILING);
+        assert!(
+            !estimate.truncated
+                || estimate.estimated_total < u64::from(SHALLOW_ESTIMATE_HARD_CEILING)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
