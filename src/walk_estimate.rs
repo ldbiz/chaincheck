@@ -24,6 +24,7 @@ pub const SHALLOW_ESTIMATE_HARD_MAX_DEPTH: u32 = 8;
 const SMALL_UNRESOLVED: usize = 2;
 const LARGE_UNRESOLVED: usize = 8;
 const PROMOTE_PER_TRANCHE: usize = 32;
+const MIN_TRANCHES_BEFORE_DIMINISHING: u32 = 2;
 
 /// Outcome of a bounded sample. UX-only; not evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,7 @@ struct Sampler<F> {
     hard_max_depth: u32,
     sample_entries: u32,
     dirs_opened: u32,
+    child_dirs: u32,
 }
 
 impl<F: FnMut(&Path, &OsStr) -> bool> Sampler<F> {
@@ -68,6 +70,7 @@ impl<F: FnMut(&Path, &OsStr) -> bool> Sampler<F> {
             hard_max_depth: initial_depth,
             sample_entries: 0,
             dirs_opened: 0,
+            child_dirs: 0,
         }
     }
 
@@ -92,12 +95,6 @@ impl<F: FnMut(&Path, &OsStr) -> bool> Sampler<F> {
                 .filter(|(_, depth)| *depth <= self.hard_max_depth)
                 .count(),
         )
-    }
-
-    fn unresolved_large(&self) -> bool {
-        self.open.is_some()
-            || self.has_promotable_frontier()
-            || self.queue.len() >= LARGE_UNRESOLVED
     }
 
     fn remaining_unknown_small(&self, estimate: u64) -> bool {
@@ -211,11 +208,49 @@ impl<F: FnMut(&Path, &OsStr) -> bool> Sampler<F> {
             return;
         }
         let child_depth = parent_depth.saturating_add(1);
+        self.child_dirs = self.child_dirs.saturating_add(1);
         if parent_depth >= self.allowed_depth {
             self.depth_frontier.push_back((path, child_depth));
             return;
         }
         self.queue.push_back((path, child_depth));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrancheSnapshot {
+    estimate: u64,
+    sample_entries: u32,
+    queue_len: usize,
+    frontier_len: usize,
+    child_dirs: u32,
+    promotable_frontier: bool,
+}
+
+impl TrancheSnapshot {
+    fn capture<F: FnMut(&Path, &OsStr) -> bool>(sampler: &Sampler<F>, limits: WalkLimits) -> Self {
+        Self {
+            estimate: sampler.estimate(limits),
+            sample_entries: sampler.sample_entries,
+            queue_len: sampler.queue.len(),
+            frontier_len: sampler.depth_frontier.len(),
+            child_dirs: sampler.child_dirs,
+            promotable_frontier: sampler.has_promotable_frontier(),
+        }
+    }
+
+    /// Whether another tranche is worth taking.
+    ///
+    /// `before` and `self` must be snapshots from two different completed
+    /// tranche states. Comparing a snapshot to itself is never worth sampling.
+    fn still_worth_sampling(&self, before: &Self) -> bool {
+        if self.promotable_frontier || self.queue_len >= LARGE_UNRESOLVED {
+            return true;
+        }
+        if self.child_dirs > before.child_dirs || self.frontier_len > before.frontier_len {
+            return true;
+        }
+        !estimate_close(Some(before.estimate), self.estimate)
     }
 }
 
@@ -258,33 +293,42 @@ fn estimate_with_config(
 ) -> WalkEntryEstimate {
     let mut sampler = Sampler::new(roots, prune_dir, cfg.initial_max_depth);
     sampler.hard_max_depth = cfg.hard_max_depth;
-    let mut prev_estimate: Option<u64> = None;
     let mut tranches = 0u32;
 
     loop {
         if sampler.sample_entries >= cfg.hard_ceiling {
             break;
         }
-        let current = sampler.estimate(limits);
         if sampler.is_complete() {
             break;
         }
-        if sampler.remaining_unknown_small(current) {
+        if sampler.remaining_unknown_small(sampler.estimate(limits)) {
             break;
         }
-        if tranches >= 1 && !sampler.unresolved_large() && estimate_close(prev_estimate, current) {
-            break;
-        }
+
+        // Snapshot the completed state *before* this tranche mutates the sampler.
+        // Stability must compare two genuine tranche states, not an estimate with itself.
+        let before = TrancheSnapshot::capture(&sampler, limits);
         sampler.prepare_tranche();
-        let before = sampler.sample_entries;
+        let before_entries = sampler.sample_entries;
         sampler.consume_entries(cfg.tranche_entries, cfg.hard_ceiling);
-        tranches = tranches.saturating_add(1);
-        prev_estimate = Some(sampler.estimate(limits));
-        if sampler.sample_entries == before
+        if sampler.sample_entries == before_entries
             && sampler.open.is_none()
             && sampler.queue.is_empty()
             && !sampler.has_promotable_frontier()
         {
+            break;
+        }
+        let after = TrancheSnapshot::capture(&sampler, limits);
+        tranches = tranches.saturating_add(1);
+
+        if sampler.is_complete() || sampler.sample_entries >= cfg.hard_ceiling {
+            break;
+        }
+        if sampler.remaining_unknown_small(after.estimate) {
+            break;
+        }
+        if tranches >= MIN_TRANCHES_BEFORE_DIMINISHING && !after.still_worth_sampling(&before) {
             break;
         }
     }
@@ -380,6 +424,36 @@ mod tests {
     }
 
     #[test]
+    fn stability_compares_distinct_completed_tranche_states() {
+        let same = TrancheSnapshot {
+            estimate: 2_048,
+            sample_entries: 1_024,
+            queue_len: 0,
+            frontier_len: 0,
+            child_dirs: 0,
+            promotable_frontier: false,
+        };
+        assert!(
+            !same.still_worth_sampling(&same),
+            "comparing a snapshot to itself must not count as useful new sampling"
+        );
+        let before = TrancheSnapshot {
+            estimate: 1_024,
+            sample_entries: 512,
+            ..same
+        };
+        let after = TrancheSnapshot {
+            estimate: 2_048,
+            sample_entries: 1_024,
+            ..same
+        };
+        assert!(
+            after.still_worth_sampling(&before),
+            "a later tranche with a materially different estimate must remain worth sampling"
+        );
+    }
+
+    #[test]
     fn small_tree_stops_cheaply() {
         let root = tmp();
         fs::create_dir_all(root.join("a/b")).unwrap();
@@ -431,12 +505,30 @@ mod tests {
         let estimate =
             estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
         assert!(estimate.truncated);
-        assert!(estimate.sample_entries <= SHALLOW_ESTIMATE_HARD_CEILING);
+        assert!(estimate.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
+        assert!(
+            estimate.sample_entries < SHALLOW_ESTIMATE_HARD_CEILING,
+            "file-only diminishing value should stop before the hard ceiling: {estimate:?}"
+        );
         assert!(estimate.sample_entries < 20_000);
         assert!(
             estimate.estimated_total > u64::from(estimate.sample_entries),
             "{estimate:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_ceiling_wins_when_new_directories_keep_appearing() {
+        let root = tmp();
+        for i in 0..9_000 {
+            fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+        }
+        let estimate =
+            estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(estimate.truncated);
+        assert_eq!(estimate.sample_entries, SHALLOW_ESTIMATE_HARD_CEILING);
+        assert!(estimate.sample_entries < 9_000);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -497,7 +589,21 @@ mod tests {
         assert!(partial.truncated);
         assert!(partial.estimated_total > u64::from(partial.sample_entries));
         let full = estimate_walk_entries_shallow([&root], |_p, _n| false, WalkLimits::production());
+        assert!(full.truncated);
         assert!(full.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES);
+        assert!(
+            full.sample_entries > SHALLOW_ESTIMATE_TRANCHE_ENTRIES * 2,
+            "must take more than two tranches when the estimate is still moving (would fail if stability compared a tranche to itself): {full:?}"
+        );
+        assert!(
+            full.sample_entries < 4_000,
+            "must stop before enumerating the whole directory: {full:?}"
+        );
+        assert!(
+            full.sample_entries < SHALLOW_ESTIMATE_HARD_CEILING,
+            "diminishing value must stop before the hard ceiling: {full:?}"
+        );
+        assert!(full.estimated_total > u64::from(full.sample_entries));
         let _ = fs::remove_dir_all(&root);
     }
 
