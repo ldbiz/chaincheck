@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::campaign::{CampaignIntelligence, discover_campaign, scan_campaign_artifacts};
+use crate::campaign::{
+    CampaignIntelligence, discover_campaign_with_progress, scan_campaign_artifacts,
+};
 use crate::campaign::{DET_CREDENTIALS, DET_DNS_CACHE, DET_GIT_HISTORY, DET_HOSTS_FILE};
 use crate::cli::ProcessConfig;
 use crate::coverage::DetectorCoverage;
@@ -12,8 +14,11 @@ use crate::git::{scan_git_with_probe, system_git};
 use crate::host::{scan_dns_cache_with_probe, scan_hosts_file, system_resolvectl};
 use crate::intelligence::IntelligenceSnapshot;
 use crate::model::Severity;
-use crate::npm::{apply_npm_corroboration, discover_npm, scan_npm_artifacts};
-use crate::python::{apply_pypi_corroboration, discover_python, scan_python_artifacts};
+use crate::npm::{apply_npm_corroboration, discover_npm_with_progress, scan_npm_artifacts};
+use crate::progress::{NoProgress, Progress};
+use crate::python::{
+    apply_pypi_corroboration, discover_python_with_progress, scan_python_artifacts,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScanScope {
@@ -156,9 +161,22 @@ pub fn scan(
     intelligence: IntelligenceSnapshot,
     campaign: &CampaignIntelligence,
 ) -> ScanResult {
-    let npm_artifacts = discover_npm(&scope, config, home);
-    let python_artifacts = discover_python(&scope, config, home);
-    let campaign_artifacts = discover_campaign(&scope, config, home);
+    scan_with_progress(scope, config, home, intelligence, campaign, &NoProgress)
+}
+
+/// Full library scan, reporting walk and stage progress.
+pub fn scan_with_progress(
+    scope: ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    intelligence: IntelligenceSnapshot,
+    campaign: &CampaignIntelligence,
+    progress: &dyn Progress,
+) -> ScanResult {
+    let npm_artifacts = discover_npm_with_progress(&scope, config, home, progress);
+    let python_artifacts = discover_python_with_progress(&scope, config, home, progress);
+    let campaign_artifacts = discover_campaign_with_progress(&scope, config, home, progress);
+    progress.stage("Checking host artefacts");
     let host = HostDetectorOutputs {
         git: scan_git_with_probe(&campaign_artifacts.git_repos, system_git()),
         hosts: scan_hosts_file(Path::new("/etc/hosts")),
@@ -173,6 +191,7 @@ pub fn scan(
         intelligence,
         campaign,
         host,
+        progress,
     )
 }
 
@@ -185,9 +204,30 @@ pub fn scan_with_host_outputs(
     campaign: &CampaignIntelligence,
     host: HostDetectorOutputs,
 ) -> ScanResult {
-    let npm_artifacts = discover_npm(&scope, config, home);
-    let python_artifacts = discover_python(&scope, config, home);
-    let campaign_artifacts = discover_campaign(&scope, config, home);
+    scan_with_host_outputs_and_progress(
+        scope,
+        config,
+        home,
+        intelligence,
+        campaign,
+        host,
+        &NoProgress,
+    )
+}
+
+/// Same as [`scan_with_host_outputs`], reporting walk and scan-stage progress.
+pub fn scan_with_host_outputs_and_progress(
+    scope: ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    intelligence: IntelligenceSnapshot,
+    campaign: &CampaignIntelligence,
+    host: HostDetectorOutputs,
+    progress: &dyn Progress,
+) -> ScanResult {
+    let npm_artifacts = discover_npm_with_progress(&scope, config, home, progress);
+    let python_artifacts = discover_python_with_progress(&scope, config, home, progress);
+    let campaign_artifacts = discover_campaign_with_progress(&scope, config, home, progress);
     complete_scan(
         scope,
         npm_artifacts,
@@ -196,6 +236,7 @@ pub fn scan_with_host_outputs(
         intelligence,
         campaign,
         host,
+        progress,
     )
 }
 
@@ -207,7 +248,9 @@ fn complete_scan(
     intelligence: IntelligenceSnapshot,
     campaign: &CampaignIntelligence,
     host: HostDetectorOutputs,
+    progress: &dyn Progress,
 ) -> ScanResult {
+    progress.stage("Scanning collected artefacts");
     let mut outputs = scan_npm_artifacts(&npm_artifacts, &intelligence.npm);
     outputs.push(DetectorOutput {
         findings: Vec::new(),
@@ -570,6 +613,51 @@ mod tests {
             "{:?}",
             result.findings
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn host_output_scan_reports_walk_and_scan_stages() {
+        use crate::campaign::CampaignIntelligence;
+        use crate::cli::ProcessConfig;
+        use crate::progress::CountingProgress;
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
+        let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "chaincheck-scan-progress-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        let project = base.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("package.json"), b"{}").unwrap();
+        let progress = CountingProgress::new();
+        let _ = scan_with_host_outputs_and_progress(
+            ScanScope::ExplicitRoot { root: project },
+            &ProcessConfig::default(),
+            None,
+            snapshot(true, true),
+            &CampaignIntelligence::bundled(),
+            HostDetectorOutputs::skipped(),
+            &progress,
+        );
+        assert_eq!(
+            progress.staged(),
+            [
+                "Walking filesystem (npm)",
+                "Walking filesystem (Python)",
+                "Walking filesystem (campaign)",
+                "Scanning collected artefacts",
+            ]
+        );
+        assert!(progress.tick_count() >= 1);
         let _ = fs::remove_dir_all(&base);
     }
 }

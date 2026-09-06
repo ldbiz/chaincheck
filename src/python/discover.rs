@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{WalkOutcome, walk_matching_files_for};
+use crate::discovery::{WalkLimits, WalkOutcome, walk_matching_files_for_with_progress};
 use crate::fsutil::{HostDirKind, classify_host_dir};
+use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
+use crate::walk_estimate::estimate_walk_entries_shallow;
 
 use super::{DET_DISCOVERY, DIST_INFO_CAP};
 
@@ -81,11 +83,31 @@ pub fn discover_python(
     discover_python_with_layout(scope, config, home, &layout)
 }
 
+pub fn discover_python_with_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    progress: &dyn Progress,
+) -> PythonArtifacts {
+    let layout = PythonHostLayout::production(config);
+    discover_python_with_layout_progress(scope, config, home, &layout, progress)
+}
+
 pub fn discover_python_with_layout(
     scope: &ScanScope,
     config: &ProcessConfig,
     home: Option<&Path>,
     layout: &PythonHostLayout,
+) -> PythonArtifacts {
+    discover_python_with_layout_progress(scope, config, home, layout, &NoProgress)
+}
+
+pub fn discover_python_with_layout_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    layout: &PythonHostLayout,
+    progress: &dyn Progress,
 ) -> PythonArtifacts {
     let walk_roots = python_walk_roots(scope, config, home, layout);
     let pip_wheel = collect_pip_wheel_roots(scope, home, config);
@@ -103,16 +125,24 @@ pub fn discover_python_with_layout(
     let prune_state = PruneState {
         install_locations: &install_locations,
     };
+    let estimate = estimate_walk_entries_shallow(
+        walk_roots.dirs.iter(),
+        python_prune_dir,
+        WalkLimits::production(),
+    );
+    progress.begin_walk_phase("Walking filesystem (Python)", estimate.estimated_total);
 
     let WalkOutcome {
         files,
         mut coverage,
-    } = walk_matching_files_for(
+    } = walk_matching_files_for_with_progress(
         DET_DISCOVERY,
         walk_roots.dirs.clone(),
         |parent, name| prune_state.prune_dir(parent, name),
         python_keep_file,
+        progress,
     );
+    progress.end_walk_phase();
 
     for (path, status) in &walk_roots.failures {
         coverage.record_artifact(path.clone(), *status);
@@ -186,27 +216,36 @@ struct PruneState<'a> {
 
 impl PruneState<'_> {
     fn prune_dir(&self, parent: &Path, name: &OsStr) -> bool {
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-        if PYTHON_PRUNE_DIRS.contains(&name) {
-            return true;
-        }
-        if name == "site-packages" || name == "dist-packages" {
-            let path = parent.join(name);
-            if matches!(classify_host_dir(&path), HostDirKind::RealDirectory) {
-                let mut locs = self.install_locations.borrow_mut();
-                if !locs.iter().any(|p| p == &path) {
-                    locs.push(path);
+        if let Some(dir_name) = name.to_str() {
+            if dir_name == "site-packages" || dir_name == "dist-packages" {
+                let path = parent.join(dir_name);
+                if matches!(classify_host_dir(&path), HostDirKind::RealDirectory) {
+                    let mut locs = self.install_locations.borrow_mut();
+                    if !locs.iter().any(|p| p == &path) {
+                        locs.push(path);
+                    }
                 }
             }
-            return true;
         }
-        if has_pyvenv_cfg(parent) {
-            return name != "lib" && name != "local";
-        }
-        false
+        python_prune_dir(parent, name)
     }
+}
+
+/// Prune predicate for Python discovery. Pure: does not record install locations.
+pub fn python_prune_dir(parent: &Path, name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if PYTHON_PRUNE_DIRS.contains(&name) {
+        return true;
+    }
+    if name == "site-packages" || name == "dist-packages" {
+        return true;
+    }
+    if has_pyvenv_cfg(parent) {
+        return name != "lib" && name != "local";
+    }
+    false
 }
 
 fn is_package_install_dir(path: &Path) -> bool {
@@ -518,7 +557,7 @@ fn should_suppress_extra_root(candidate: &Path, walk_roots: &[PathBuf]) -> bool 
 }
 
 /// True when the home/project walk would already visit `child` under the same
-/// prune rules as [`PruneState::prune_dir`]: [`PYTHON_PRUNE_DIRS`], the
+/// prune rules as [`python_prune_dir`]: [`PYTHON_PRUNE_DIRS`], the
 /// site-packages prune hook, and `pyvenv.cfg` children other than `lib`/`local`.
 fn is_reachable_through_pruned_walk(child: &Path, parent: &Path) -> bool {
     let Ok(relative) = child.strip_prefix(parent) else {
@@ -635,6 +674,65 @@ mod tests {
                 .eq(&CoverageStatus::Completed)
                 || artifacts.walk_coverage.status() == CoverageStatus::Partial
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn python_progress_lookahead_does_not_change_artefacts_or_coverage() {
+        use crate::progress::CountingProgress;
+
+        let base = tmp();
+        let home = base.join("home");
+        let site = home.join(".local/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site.join("cool_pkg-1.0.0.dist-info")).unwrap();
+        std::fs::write(
+            site.join("cool_pkg-1.0.0.dist-info/METADATA"),
+            "Name: cool-pkg\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("project")).unwrap();
+        std::fs::write(home.join("project/requirements.txt"), b"cool-pkg==1.0.0\n").unwrap();
+        for i in 0..40 {
+            std::fs::create_dir_all(home.join(format!("noise/d{i}"))).unwrap();
+            std::fs::write(home.join(format!("noise/d{i}/x.txt")), b"n").unwrap();
+        }
+        let venv_site = home.join(".venv/lib/python3.12/site-packages");
+        std::fs::create_dir_all(&venv_site.join("other-2.0.0.dist-info")).unwrap();
+        std::fs::write(
+            venv_site.join("other-2.0.0.dist-info/METADATA"),
+            "Name: other\nVersion: 2.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(home.join(".venv/pyvenv.cfg"), b"home = /usr\n").unwrap();
+        let layout = layout_with(base.join("usr"));
+        let scope = ScanScope::WholeUser { home: home.clone() };
+        let config = ProcessConfig::default();
+
+        let baseline = discover_python_with_layout(&scope, &config, Some(&home), &layout);
+        let progress = CountingProgress::new();
+        let with_progress =
+            discover_python_with_layout_progress(&scope, &config, Some(&home), &layout, &progress);
+
+        let sort_paths = |paths: &mut Vec<PathBuf>| paths.sort();
+        let mut base_meta = baseline.metadata.clone();
+        let mut prog_meta = with_progress.metadata.clone();
+        sort_paths(&mut base_meta);
+        sort_paths(&mut prog_meta);
+        assert_eq!(base_meta, prog_meta);
+        let mut base_req = baseline.requirements.clone();
+        let mut prog_req = with_progress.requirements.clone();
+        sort_paths(&mut base_req);
+        sort_paths(&mut prog_req);
+        assert_eq!(base_req, prog_req);
+        assert_eq!(
+            baseline.walk_coverage.status(),
+            with_progress.walk_coverage.status()
+        );
+        assert_eq!(
+            baseline.walk_coverage.failure_counts(),
+            with_progress.walk_coverage.failure_counts()
+        );
+        assert!(progress.tick_count() >= 1);
         let _ = std::fs::remove_dir_all(&base);
     }
 

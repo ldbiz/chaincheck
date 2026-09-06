@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::DetectorCoverage;
-use crate::discovery::{WalkOutcome, walk_matching_files_for};
+use crate::discovery::{WalkLimits, WalkOutcome, walk_matching_files_for_with_progress};
 use crate::npm::npm_package_roots;
+use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;
+use crate::walk_estimate::estimate_walk_entries_shallow;
 
 use super::DET_CAMPAIGN_WALK;
 use super::intelligence::is_payload_name;
@@ -59,12 +61,27 @@ pub fn discover_campaign(
     config: &ProcessConfig,
     home: Option<&Path>,
 ) -> CampaignArtifacts {
+    discover_campaign_with_progress(scope, config, home, &NoProgress)
+}
+
+pub fn discover_campaign_with_progress(
+    scope: &ScanScope,
+    config: &ProcessConfig,
+    home: Option<&Path>,
+    progress: &dyn Progress,
+) -> CampaignArtifacts {
     let roots = npm_package_roots(scope, config, home);
+    let estimate = estimate_walk_entries_shallow(
+        roots.dirs.iter(),
+        campaign_prune_dir,
+        WalkLimits::production(),
+    );
+    progress.begin_walk_phase("Walking filesystem (campaign)", estimate.estimated_total);
     let mut git_repos = Vec::new();
     let WalkOutcome {
         files,
         mut coverage,
-    } = walk_matching_files_for(
+    } = walk_matching_files_for_with_progress(
         DET_CAMPAIGN_WALK,
         roots.dirs,
         |parent, name| {
@@ -77,7 +94,9 @@ pub fn discover_campaign(
             campaign_prune_dir(parent, name)
         },
         campaign_keep_file,
+        progress,
     );
+    progress.end_walk_phase();
 
     for (path, status) in roots.failures {
         coverage.record_artifact(path, status);

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use crate::coverage::{ArtifactStatus, DetectorCoverage, DetectorId};
 use crate::model::{Ecosystem, PackageIdentity, PackageKey, PackageVersion};
+use crate::progress::{NoProgress, Progress};
 
 pub use fetch::{FETCH_TIMEOUT, fetch_feed_url};
 pub use parse::parse_malware_feed;
@@ -256,10 +257,16 @@ pub(crate) fn synthesize_coverage(
 
 /// Live npm and PyPI fetches. No persistent cache and no offline fallback.
 pub fn load_generic_intelligence() -> IntelligenceSnapshot {
-    load_generic_intelligence_from(
+    load_generic_intelligence_with_progress(&NoProgress)
+}
+
+/// Live npm and PyPI fetches, reporting each feed as a progress stage.
+pub fn load_generic_intelligence_with_progress(progress: &dyn Progress) -> IntelligenceSnapshot {
+    load_generic_intelligence_from_with_progress(
         NPM_MALWARE_FEED_URL,
         PYPI_MALWARE_FEED_URL,
         FetchLimits::production(),
+        progress,
     )
 }
 
@@ -269,7 +276,18 @@ pub fn load_generic_intelligence_from(
     pypi_url: &str,
     limits: FetchLimits,
 ) -> IntelligenceSnapshot {
+    load_generic_intelligence_from_with_progress(npm_url, pypi_url, limits, &NoProgress)
+}
+
+fn load_generic_intelligence_from_with_progress(
+    npm_url: &str,
+    pypi_url: &str,
+    limits: FetchLimits,
+    progress: &dyn Progress,
+) -> IntelligenceSnapshot {
+    progress.stage("Fetching npm intelligence");
     let npm = fetch_feed_url(npm_url, Ecosystem::Npm, limits);
+    progress.stage("Fetching PyPI intelligence");
     let pypi = fetch_feed_url(pypi_url, Ecosystem::Pypi, limits);
     let coverage = vec![
         synthesize_coverage(Ecosystem::Npm, &npm),

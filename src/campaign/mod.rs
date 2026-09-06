@@ -22,7 +22,8 @@ use crate::scan::DetectorOutput;
 
 pub use config::scan_ide_config;
 pub use content::content_ioc_matches;
-pub use discover::{CampaignArtifacts, discover_campaign};
+pub(crate) use discover::discover_campaign_with_progress;
+pub use discover::{CampaignArtifacts, campaign_prune_dir, discover_campaign};
 pub use intelligence::CampaignIntelligence;
 pub use logs::ioc_findings_from_log_text;
 pub use manifest::preinstall_hook_finding;
