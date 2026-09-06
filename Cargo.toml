@@ -1,6 +1,6 @@
 [package]
 name = "chaincheck"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.98"
 description = "Read-only Linux/WSL scanner for retrospective local evidence of known malicious software supply-chain activity."
