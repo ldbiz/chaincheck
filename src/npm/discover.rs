@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ProcessConfig;
 use crate::coverage::{ArtifactStatus, DetectorCoverage};
-use crate::discovery::{
-    WalkLimits, WalkOutcome, walk_matching_files_with_progress,
-};
+use crate::discovery::{WalkLimits, WalkOutcome, walk_matching_files_with_progress};
 use crate::fsutil::{HostDirKind, TextReadOutcome, classify_host_dir, read_utf8_bounded};
 use crate::progress::{NoProgress, Progress};
 use crate::scan::ScanScope;

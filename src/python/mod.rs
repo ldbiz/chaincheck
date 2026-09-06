@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub(crate) use discover::discover_python_with_progress;
 pub use discover::{
     PythonArtifacts, PythonHostLayout, discover_python, discover_python_with_layout,
-    python_keep_file,
+    python_keep_file, python_prune_dir,
 };
 pub use wheel_cache::scan_pip_wheel_cache;
 
