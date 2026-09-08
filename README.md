@@ -23,7 +23,9 @@ Supported GNU Linux binaries:
 | `x86_64` / `amd64` | `chaincheck-linux-x86_64` |
 | `aarch64` / `arm64` | `chaincheck-linux-aarch64` |
 
-These binaries are built on Ubuntu 24.04 runners (that image's glibc). musl/static binaries are out of scope.
+Release binaries require **glibc 2.39 or newer** (Ubuntu 24.04 and equivalent). They are built on Ubuntu 24.04 runners; musl/static binaries are out of scope. On older distros (for example Ubuntu 22.04 or RHEL 9), use [build from source](#build-from-source-with-cargo) or the [install script](#install-script) on that machine instead.
+
+If a downloaded release fails with `GLIBC_2.39 not found`, your host glibc is too old for the prebuilt binary — build from source on that host.
 
 ```bash
 arch=$(uname -m)
@@ -55,7 +57,7 @@ chmod +x ~/.local/bin/chaincheck
 
 ### Install script
 
-The script runs the same Cargo build and copies the binary to `~/.local/bin/chaincheck`. It does not download a prebuilt release. Requires `git` and `cargo`.
+The script runs the same Cargo build and copies the binary to `~/.local/bin/chaincheck`. It does not download a prebuilt release. Use this when the release binary does not match your host glibc. Requires `git` and `cargo`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ldbiz/chaincheck/main/scripts/install.sh | bash
