@@ -1,5 +1,6 @@
 //! Semantic `ScanResult` rendered to `summary.txt`, `findings.tsv`, and a bounded console.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ pub const PRIVACY_WARNING: &str =
 const CONSOLE_EVIDENCE_CAP: usize = 10;
 const SOURCE_IDENTITY_MAX_BYTES: u64 = 1_000_000;
 const FIXTURE_HEADLINE_NOTE: &str = "see ChainCheck fixture note below";
+const FIXTURE_FINDING_TAG: &str = "[likely ChainCheck fixture]";
 
 #[derive(Debug)]
 pub struct WrittenReports {
@@ -37,6 +39,8 @@ pub fn write_reports(result: &ScanResult, report_dir: &Path) -> Result<WrittenRe
 }
 
 pub fn console_brief(result: &ScanResult, reports: &WrittenReports) -> String {
+    let (evidence, informational) = split_findings(&result.findings);
+    let fixtures = FixtureAnnotation::classify(&evidence);
     let mut lines = Vec::new();
     lines.push("ChainCheck retrospective malware scan".to_owned());
     lines.push(String::new());
@@ -46,26 +50,15 @@ pub fn console_brief(result: &ScanResult, reports: &WrittenReports) -> String {
     lines.push(String::new());
     lines.extend(major_detector_status_lines(result));
     lines.push(String::new());
-    lines.extend(overall_result_lines(result));
+    lines.extend(overall_result_lines(result, &fixtures));
     lines.push(String::new());
-    let (evidence, informational) = split_findings(&result.findings);
-    let fixture_findings = likely_chaincheck_fixture_findings(&evidence);
     lines.push(format!("Evidence findings: {}", evidence.len()));
-    if !fixture_findings.is_empty() {
-        lines.push(format!(
-            "  Likely ChainCheck test fixtures: {}",
-            fixture_findings.len()
-        ));
-        lines.push(format!(
-            "  Other evidence findings: {}",
-            evidence.len() - fixture_findings.len()
-        ));
-    }
+    lines.extend(fixture_count_lines(&fixtures));
     lines.push(format!(
         "Informational/context observations: {}",
         informational.len()
     ));
-    if !fixture_findings.is_empty() {
+    if !fixtures.is_empty() {
         lines.push(String::new());
         lines.extend(chaincheck_fixture_note_lines());
     }
@@ -76,12 +69,9 @@ pub fn console_brief(result: &ScanResult, reports: &WrittenReports) -> String {
         lines.push(String::new());
         lines.push("Evidence findings:".to_owned());
         for finding in evidence.iter().take(CONSOLE_EVIDENCE_CAP) {
-            lines.push(format!(
-                "  [{}] {}: {} - {}",
-                severity_label(finding.severity),
-                finding.code.as_str(),
-                location_text(finding),
-                sanitize_field(&finding.detail)
+            lines.push(format_console_evidence_line(
+                finding,
+                fixtures.contains(finding),
             ));
         }
         if evidence.len() > CONSOLE_EVIDENCE_CAP {
@@ -126,20 +116,20 @@ fn findings_tsv_body(result: &ScanResult) -> String {
 }
 
 fn summary_body(result: &ScanResult, tsv: &Path) -> String {
+    let (evidence, informational) = split_findings(&result.findings);
+    let fixtures = FixtureAnnotation::classify(&evidence);
     let mut lines = Vec::new();
     lines.push("ChainCheck retrospective malware scan".to_owned());
     lines.push("=".repeat(39));
     lines.push(format!("Primary root:   {}", primary_root(result)));
     lines.push(String::new());
-    lines.extend(overall_result_lines(result));
+    lines.extend(overall_result_lines(result, &fixtures));
     lines.push(String::new());
     lines.extend(intelligence_status_lines(result));
     lines.push(String::new());
     lines.extend(major_detector_status_lines(result));
     lines.push(String::new());
 
-    let (evidence, informational) = split_findings(&result.findings);
-    let fixture_findings = likely_chaincheck_fixture_findings(&evidence);
     let confirmed = count_severity(&evidence, Severity::Confirmed);
     let high = count_severity(&evidence, Severity::High);
     let medium = count_severity(&evidence, Severity::Medium);
@@ -156,15 +146,8 @@ fn summary_body(result: &ScanResult, tsv: &Path) -> String {
     lines.push(format!(
         "  MEDIUM    : {medium}   needs review; not proof on its own"
     ));
-    if !fixture_findings.is_empty() {
-        lines.push(format!(
-            "  Likely ChainCheck test fixtures: {}",
-            fixture_findings.len()
-        ));
-        lines.push(format!(
-            "  Other evidence findings: {}",
-            evidence.len() - fixture_findings.len()
-        ));
+    lines.extend(fixture_count_lines(&fixtures));
+    if !fixtures.is_empty() {
         lines.push(String::new());
         lines.extend(chaincheck_fixture_note_lines());
     }
@@ -209,12 +192,8 @@ fn summary_body(result: &ScanResult, tsv: &Path) -> String {
     lines.join("\n") + "\n"
 }
 
-fn overall_result_lines(result: &ScanResult) -> Vec<String> {
-    let fixture_marker = if has_likely_chaincheck_fixture_findings(result) {
-        format!(" — {FIXTURE_HEADLINE_NOTE}")
-    } else {
-        String::new()
-    };
+fn overall_result_lines(result: &ScanResult, fixtures: &FixtureAnnotation<'_>) -> Vec<String> {
+    let fixture_marker = fixtures.headline_suffix();
     match result.outcome {
         ScanOutcome::StrongEvidence => vec![
             format!("Result: Action recommended — strong malware evidence detected{fixture_marker}"),
@@ -240,22 +219,86 @@ fn overall_result_lines(result: &ScanResult) -> Vec<String> {
     }
 }
 
-fn has_likely_chaincheck_fixture_findings(result: &ScanResult) -> bool {
-    result
-        .findings
-        .iter()
-        .any(|finding| finding.severity.is_evidence() && is_likely_chaincheck_fixture(finding))
+struct FixtureAnnotation<'a> {
+    findings: Vec<&'a Finding>,
+    evidence_count: usize,
 }
 
-fn likely_chaincheck_fixture_findings<'a>(findings: &[&'a Finding]) -> Vec<&'a Finding> {
-    findings
-        .iter()
-        .copied()
-        .filter(|finding| is_likely_chaincheck_fixture(finding))
-        .collect()
+impl<'a> FixtureAnnotation<'a> {
+    fn classify(evidence: &[&'a Finding]) -> Self {
+        let mut identity_cache = HashMap::new();
+        let findings = evidence
+            .iter()
+            .copied()
+            .filter(|finding| is_likely_chaincheck_fixture(finding, &mut identity_cache))
+            .collect();
+        Self {
+            findings,
+            evidence_count: evidence.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.findings.len()
+    }
+
+    fn other_count(&self) -> usize {
+        self.evidence_count - self.findings.len()
+    }
+
+    fn contains(&self, finding: &Finding) -> bool {
+        self.findings
+            .iter()
+            .any(|candidate| std::ptr::eq(*candidate, finding))
+    }
+
+    fn headline_suffix(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let other = self.other_count();
+        if other == 0 {
+            format!(" — {FIXTURE_HEADLINE_NOTE}")
+        } else {
+            let noun = if other == 1 { "finding" } else { "findings" };
+            format!(" — including {other} other evidence {noun}; {FIXTURE_HEADLINE_NOTE}")
+        }
+    }
 }
 
-fn is_likely_chaincheck_fixture(finding: &Finding) -> bool {
+fn fixture_count_lines(fixtures: &FixtureAnnotation<'_>) -> Vec<String> {
+    if fixtures.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("  Likely ChainCheck test fixtures: {}", fixtures.len()),
+        format!("  Other evidence findings: {}", fixtures.other_count()),
+    ]
+}
+
+fn format_console_evidence_line(finding: &Finding, fixture: bool) -> String {
+    let mut line = format!(
+        "  [{}] {}: {} - {}",
+        severity_label(finding.severity),
+        finding.code.as_str(),
+        location_text(finding),
+        sanitize_field(&finding.detail)
+    );
+    if fixture {
+        line.push(' ');
+        line.push_str(FIXTURE_FINDING_TAG);
+    }
+    line
+}
+
+fn is_likely_chaincheck_fixture(
+    finding: &Finding,
+    identity_cache: &mut HashMap<PathBuf, bool>,
+) -> bool {
     let Some(location) = finding.location.as_deref() else {
         return false;
     };
@@ -272,15 +315,29 @@ fn is_likely_chaincheck_fixture(finding: &Finding) -> bool {
         let Some(repo_root) = tests_dir.parent() else {
             continue;
         };
-        if looks_like_chaincheck_source_root(repo_root) {
+        if looks_like_chaincheck_source_root(repo_root, identity_cache) {
             return true;
         }
     }
     false
 }
 
-fn looks_like_chaincheck_source_root(root: &Path) -> bool {
-    if !root.join("src/self_test.rs").is_file() || !root.join("tests/cases.json").is_file() {
+fn looks_like_chaincheck_source_root(
+    root: &Path,
+    identity_cache: &mut HashMap<PathBuf, bool>,
+) -> bool {
+    if let Some(&cached) = identity_cache.get(root) {
+        return cached;
+    }
+    let identified = identify_chaincheck_source_root(root);
+    identity_cache.insert(root.to_path_buf(), identified);
+    identified
+}
+
+fn identify_chaincheck_source_root(root: &Path) -> bool {
+    if !root.join("src").join("self_test.rs").is_file()
+        || !root.join("tests").join("cases.json").is_file()
+    {
         return false;
     }
     let cargo_toml = root.join("Cargo.toml");
@@ -293,18 +350,65 @@ fn looks_like_chaincheck_source_root(root: &Path) -> bool {
     let Ok(content) = fs::read_to_string(cargo_toml) else {
         return false;
     };
+    cargo_toml_identifies_chaincheck(&content)
+}
+
+fn cargo_toml_identifies_chaincheck(content: &str) -> bool {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut in_package = false;
     for raw_line in content.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') {
+        let line = toml_strip_comment(raw_line);
+        if is_toml_table_header(line) {
             in_package = line == "[package]";
             continue;
         }
-        if in_package && line == "name = \"chaincheck\"" {
+        if in_package && toml_package_name_is_chaincheck(line) {
             return true;
         }
     }
     false
+}
+
+fn toml_strip_comment(line: &str) -> &str {
+    let mut in_string = None;
+    for (index, ch) in line.char_indices() {
+        match in_string {
+            Some(quote) if ch == quote => in_string = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => in_string = Some(ch),
+            None if ch == '#' => return line[..index].trim(),
+            None => {}
+        }
+    }
+    line.trim()
+}
+
+fn is_toml_table_header(line: &str) -> bool {
+    line.starts_with('[') && line.ends_with(']')
+}
+
+fn toml_package_name_is_chaincheck(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("name") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix('=') else {
+        return false;
+    };
+    quoted_toml_scalar(rest.trim_start()) == Some("chaincheck")
+}
+
+fn quoted_toml_scalar(value: &str) -> Option<&str> {
+    let quote = value.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let rest = &value[1..];
+    let end = rest.find(quote as char)?;
+    if !rest[end + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(&rest[..end])
 }
 
 fn chaincheck_fixture_note_lines() -> Vec<String> {
@@ -594,12 +698,13 @@ mod tests {
     use crate::coverage::{ArtifactStatus, DetectorId};
     use crate::evidence::Finding;
     use crate::intelligence::{
-        EcosystemIntelligence, FeedFailure, IntelligenceSnapshot, parse_malware_feed,
+        parse_malware_feed, EcosystemIntelligence, FeedFailure, IntelligenceSnapshot,
     };
     use crate::model::{
         Ecosystem, EvidenceKind, FindingCode, FindingSubject, PackageIdentity, PackageKey,
         PackageVersion,
     };
+    use crate::scan::normal_scan_exit;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -659,6 +764,22 @@ mod tests {
             detail: detail.to_owned(),
             intelligence_source: None,
         }
+    }
+
+    fn chaincheck_source_tree(cargo_toml: &str) -> PathBuf {
+        let source = tmp();
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::create_dir_all(source.join("tests").join("fixtures").join("npm")).unwrap();
+        fs::write(source.join("Cargo.toml"), cargo_toml).unwrap();
+        fs::write(source.join("src").join("self_test.rs"), "// marker\n").unwrap();
+        fs::write(source.join("tests").join("cases.json"), "[]\n").unwrap();
+        source
+    }
+
+    fn write_reports_of(result: &ScanResult) -> (WrittenReports, PathBuf) {
+        let report_dir = tmp();
+        let written = write_reports(result, &report_dir).unwrap();
+        (written, report_dir)
     }
 
     #[test]
@@ -756,17 +877,69 @@ mod tests {
     }
 
     #[test]
+    fn fixture_headline_suffix_distinguishes_mixed_and_fixture_only() {
+        let fixture_finding = finding(Severity::Medium, "lockfile-package", Some("/tmp/x"), "a");
+        let fixture_only = FixtureAnnotation {
+            findings: vec![&fixture_finding],
+            evidence_count: 1,
+        };
+        assert_eq!(
+            fixture_only.headline_suffix(),
+            format!(" — {FIXTURE_HEADLINE_NOTE}")
+        );
+        let one_other = FixtureAnnotation {
+            findings: vec![&fixture_finding],
+            evidence_count: 2,
+        };
+        assert!(one_other
+            .headline_suffix()
+            .contains("including 1 other evidence finding;"));
+        let two_other = FixtureAnnotation {
+            findings: vec![&fixture_finding],
+            evidence_count: 3,
+        };
+        assert!(two_other
+            .headline_suffix()
+            .contains("including 2 other evidence findings;"));
+        let empty = FixtureAnnotation {
+            findings: vec![],
+            evidence_count: 2,
+        };
+        assert_eq!(empty.headline_suffix(), "");
+    }
+
+    #[test]
+    fn cargo_toml_identifies_chaincheck_package_name_forms() {
+        assert!(cargo_toml_identifies_chaincheck(
+            "[package]\nname = \"chaincheck\"\nversion = \"0.0.0\"\n"
+        ));
+        assert!(cargo_toml_identifies_chaincheck(
+            "[package]\nname=\"chaincheck\"\n"
+        ));
+        assert!(cargo_toml_identifies_chaincheck(
+            "[package]\nname = 'chaincheck'\n"
+        ));
+        assert!(cargo_toml_identifies_chaincheck(
+            "[package] # crate\nname = \"chaincheck\" # pkg\n"
+        ));
+        assert!(cargo_toml_identifies_chaincheck(
+            "\u{feff}[package]\nname = \"chaincheck\"\n"
+        ));
+        assert!(!cargo_toml_identifies_chaincheck(
+            "[package]\nname = \"other\"\n[lib]\nname = \"chaincheck\"\n"
+        ));
+        assert!(!cargo_toml_identifies_chaincheck(
+            "[package]\nname.workspace = true\n"
+        ));
+        assert!(!cargo_toml_identifies_chaincheck(
+            "[package]\nname = \"chaincheck-tools\"\n"
+        ));
+    }
+
+    #[test]
     fn chaincheck_fixture_annotation_is_visible_but_does_not_suppress() {
-        let source = tmp();
-        fs::create_dir_all(source.join("src")).unwrap();
-        fs::create_dir_all(source.join("tests/fixtures/npm")).unwrap();
-        fs::write(
-            source.join("Cargo.toml"),
-            "[package]\nname = \"chaincheck\"\nversion = \"0.0.0\"\n",
-        )
-        .unwrap();
-        fs::write(source.join("src/self_test.rs"), "// marker\n").unwrap();
-        fs::write(source.join("tests/cases.json"), "[]\n").unwrap();
+        let source =
+            chaincheck_source_tree("[package]\nname = \"chaincheck\"\nversion = \"0.0.0\"\n");
         let fixture = source.join("tests/fixtures/npm/package-lock.json");
         fs::write(&fixture, "{}\n").unwrap();
         let result = ScanResult {
@@ -784,18 +957,127 @@ mod tests {
             package_evidence: vec![],
             coverage: vec![],
         };
-        let report_dir = tmp();
-        let written = write_reports(&result, &report_dir).unwrap();
+        assert_eq!(result.outcome, ScanOutcome::MediumEvidence);
+        assert_eq!(normal_scan_exit(result.outcome), 1);
+        let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
         assert!(summary.contains("Result: Review recommended — MEDIUM evidence detected — see ChainCheck fixture note below"));
+        assert!(!summary.contains("other evidence finding"));
         assert!(summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
         assert!(summary.contains("Other evidence findings: 0"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
-        assert!(tsv.contains("MEDIUM\tlockfile-package"));
+        let expected_row = format!(
+            "MEDIUM\tlockfile-package\t{}\tsynthetic fixture\n",
+            fixture.display()
+        );
+        assert!(tsv.starts_with("severity\tcategory\tlocation\tdetail\n"));
+        assert!(tsv.contains(&expected_row), "{tsv}");
+        assert_eq!(tsv.lines().nth(1).unwrap().split('\t').count(), 4);
         let console = console_brief(&result, &written);
         assert!(console.contains("see ChainCheck fixture note below"));
         assert!(console.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
+        assert!(console.contains(FIXTURE_FINDING_TAG));
+        assert_eq!(result.outcome, ScanOutcome::MediumEvidence);
+        assert_eq!(normal_scan_exit(result.outcome), 1);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn chaincheck_fixture_strong_evidence_keeps_headline_and_exit_code() {
+        let source = chaincheck_source_tree("[package]\nname=\"chaincheck\"\n");
+        let fixture = source.join("tests/fixtures/npm/package.json");
+        fs::write(&fixture, "{}\n").unwrap();
+        let result = ScanResult {
+            scope: ScanScope::ExplicitRoot {
+                root: source.clone(),
+            },
+            outcome: ScanOutcome::StrongEvidence,
+            intelligence: snap(true, true),
+            findings: vec![finding(
+                Severity::High,
+                "installed-package",
+                fixture.to_str(),
+                "synthetic installed fixture",
+            )],
+            package_evidence: vec![],
+            coverage: vec![],
+        };
+        assert_eq!(normal_scan_exit(result.outcome), 2);
+        let (written, report_dir) = write_reports_of(&result);
+        let summary = fs::read_to_string(&written.summary).unwrap();
+        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — see ChainCheck fixture note below"));
+        assert!(!summary.contains("other evidence finding"));
+        let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
+        let expected_row = format!(
+            "HIGH\tinstalled-package\t{}\tsynthetic installed fixture\n",
+            fixture.display()
+        );
+        assert!(tsv.contains(&expected_row), "{tsv}");
+        let console = console_brief(&result, &written);
+        assert!(console.contains(&format!(
+            "[HIGH] installed-package: {} - synthetic installed fixture {FIXTURE_FINDING_TAG}",
+            fixture.display()
+        )));
+        assert_eq!(normal_scan_exit(result.outcome), 2);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn mixed_fixture_and_other_evidence_headline_does_not_explain_away_the_result() {
+        let source = chaincheck_source_tree("[package]\nname = 'chaincheck'\n");
+        let fixture = source.join("tests/fixtures/npm/package-lock.json");
+        fs::write(&fixture, "{}\n").unwrap();
+        let real = PathBuf::from("/tmp/real-project/package-lock.json");
+        let result = ScanResult {
+            scope: ScanScope::WholeUser {
+                home: PathBuf::from("/home/user"),
+            },
+            outcome: ScanOutcome::StrongEvidence,
+            intelligence: snap(true, true),
+            findings: vec![
+                finding(
+                    Severity::Medium,
+                    "lockfile-package",
+                    fixture.to_str(),
+                    "synthetic fixture",
+                ),
+                finding(
+                    Severity::High,
+                    "installed-package",
+                    real.to_str(),
+                    "real installed package",
+                ),
+            ],
+            package_evidence: vec![],
+            coverage: vec![],
+        };
+        assert_eq!(normal_scan_exit(result.outcome), 2);
+        let (written, report_dir) = write_reports_of(&result);
+        let summary = fs::read_to_string(&written.summary).unwrap();
+        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — including 1 other evidence finding; see ChainCheck fixture note below"));
+        assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
+        assert!(summary.contains("Other evidence findings: 1"));
+        let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
+        assert!(tsv.contains(&format!(
+            "MEDIUM\tlockfile-package\t{}\tsynthetic fixture\n",
+            fixture.display()
+        )));
+        assert!(tsv.contains("HIGH\tinstalled-package\t/tmp/real-project/package-lock.json\treal installed package\n"));
+        let console = console_brief(&result, &written);
+        assert!(console
+            .contains("including 1 other evidence finding; see ChainCheck fixture note below"));
+        assert!(console.contains(&format!(
+            "[MEDIUM] lockfile-package: {} - synthetic fixture {FIXTURE_FINDING_TAG}",
+            fixture.display()
+        )));
+        assert!(console.contains(
+            "[HIGH] installed-package: /tmp/real-project/package-lock.json - real installed package"
+        ));
+        assert!(!console.contains(&format!("real installed package {FIXTURE_FINDING_TAG}")));
+        assert_eq!(normal_scan_exit(result.outcome), 2);
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&report_dir);
     }
@@ -826,11 +1108,45 @@ mod tests {
             package_evidence: vec![],
             coverage: vec![],
         };
-        let report_dir = tmp();
-        let written = write_reports(&result, &report_dir).unwrap();
+        let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
         assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
         assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
+        let console = console_brief(&result, &written);
+        assert!(!console.contains(FIXTURE_FINDING_TAG));
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn chaincheck_name_outside_package_table_is_not_annotated() {
+        let source = chaincheck_source_tree(
+            "[package]\nname = \"other\"\nversion = \"0.0.0\"\n[lib]\nname = \"chaincheck\"\n",
+        );
+        let fixture = source.join("tests/fixtures/npm/package-lock.json");
+        fs::write(&fixture, "{}\n").unwrap();
+        let result = ScanResult {
+            scope: ScanScope::ExplicitRoot {
+                root: source.clone(),
+            },
+            outcome: ScanOutcome::MediumEvidence,
+            intelligence: snap(true, true),
+            findings: vec![finding(
+                Severity::Medium,
+                "lockfile-package",
+                fixture.to_str(),
+                "lib name only",
+            )],
+            package_evidence: vec![],
+            coverage: vec![],
+        };
+        let (written, report_dir) = write_reports_of(&result);
+        let summary = fs::read_to_string(&written.summary).unwrap();
+        assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
+        assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
+        let console = console_brief(&result, &written);
+        assert!(!console.contains(FIXTURE_FINDING_TAG));
+        assert_eq!(normal_scan_exit(result.outcome), 1);
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&report_dir);
     }
