@@ -30,6 +30,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 src=""
+used_existing_checkout=false
 script_src="${BASH_SOURCE[0]:-}"
 if [[ -n "$script_src" && -f "$script_src" &&
       "$script_src" != /dev/fd/* &&
@@ -40,6 +41,7 @@ if [[ -n "$script_src" && -f "$script_src" &&
   if [[ -f "$candidate/Cargo.toml" && -f "$candidate/src/main.rs" ]] &&
      grep -q '^name = "chaincheck"' "$candidate/Cargo.toml"; then
     src=$candidate
+    used_existing_checkout=true
   fi
 fi
 
@@ -64,6 +66,10 @@ install -m 755 "$src/target/release/chaincheck" "$BIN_DIR/chaincheck"
 
 installed="$BIN_DIR/chaincheck"
 echo "Installed $installed"
+if [[ "$used_existing_checkout" == true ]]; then
+  echo "Note: the source checkout is not required to run the installed binary."
+  echo "      It contains synthetic test fixtures that may appear as findings in system-wide scans."
+fi
 on_path=$(command -v chaincheck 2>/dev/null || true)
 if [[ -z "$on_path" ]]; then
   echo "Note: $BIN_DIR is not on PATH. Add it yourself or invoke $installed by path."
