@@ -67,6 +67,26 @@ curl -fsSL https://raw.githubusercontent.com/ldbiz/chaincheck/main/scripts/insta
 
 From a clone, run `./scripts/install.sh` instead. When run from an existing checkout, the script reminds you that the checkout is not required by the installed binary and that its synthetic fixtures can appear in system-wide scans. The one-line `curl` form uses a temporary clone and removes it automatically when installation completes.
 
+### Uninstall
+
+ChainCheck installs a single executable. It does not modify `PATH`, shell profiles, or system configuration.
+
+Remove the binary (default location):
+
+```bash
+rm -f ~/.local/bin/chaincheck
+```
+
+If you used a custom install directory, remove `chaincheck` from that path instead (the install script honours `CHAINCHECK_BIN_DIR`).
+
+Optional cleanup:
+
+- **Scan reports:** each run writes `$HOME/chaincheck-<UTC-timestamp>/` unless `CHAINCHECK_REPORT_DIR` is set. Delete individual directories when you no longer need them; they contain local filesystem paths.
+- **Source checkout:** if you cloned the repository only to build or run `install.sh`, you may remove the checkout after uninstalling the binary. The checkout contains synthetic test fixtures that can appear in system-wide scans while it remains on disk.
+- **Scheduled scans:** if you added a cron job from [Optional scheduled retrospective scans](#optional-scheduled-retrospective-scans), remove that cron entry yourself; uninstall does not change crontab.
+
+Verify removal with `command -v chaincheck`; if a path is still printed, another copy exists elsewhere on your `PATH`.
+
 ## Basic usage
 
 ```bash
