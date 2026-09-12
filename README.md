@@ -14,7 +14,7 @@ ChainCheck is Linux/WSL only. None of these options edit `PATH` or shell profile
 
 ### Download a release
 
-The current release is [0.1.2](https://github.com/ldbiz/chaincheck/releases/tag/v0.1.2).
+The current release is [0.1.3](https://github.com/ldbiz/chaincheck/releases/tag/v0.1.3).
 
 Supported GNU Linux binaries:
 
