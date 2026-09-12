@@ -260,12 +260,18 @@ impl<'a> FixtureAnnotation<'a> {
         if self.is_empty() {
             return String::new();
         }
-        let other = self.other_count();
-        if other == 0 {
+        let unidentified = self.other_count();
+        if unidentified == 0 {
             format!(" — {FIXTURE_HEADLINE_NOTE}")
         } else {
-            let noun = if other == 1 { "finding" } else { "findings" };
-            format!(" — including {other} other evidence {noun}; {FIXTURE_HEADLINE_NOTE}")
+            let noun = if unidentified == 1 {
+                "finding"
+            } else {
+                "findings"
+            };
+            format!(
+                " — including {unidentified} evidence {noun} not identified as a ChainCheck fixture; {FIXTURE_HEADLINE_NOTE}"
+            )
         }
     }
 }
@@ -276,7 +282,10 @@ fn fixture_count_lines(fixtures: &FixtureAnnotation<'_>) -> Vec<String> {
     }
     vec![
         format!("  Likely ChainCheck test fixtures: {}", fixtures.len()),
-        format!("  Other evidence findings: {}", fixtures.other_count()),
+        format!(
+            "  Evidence findings not identified as ChainCheck fixtures: {}",
+            fixtures.other_count()
+        ),
     ]
 }
 
@@ -355,60 +364,14 @@ fn identify_chaincheck_source_root(root: &Path) -> bool {
 
 fn cargo_toml_identifies_chaincheck(content: &str) -> bool {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let mut in_package = false;
-    for raw_line in content.lines() {
-        let line = toml_strip_comment(raw_line);
-        if is_toml_table_header(line) {
-            in_package = line == "[package]";
-            continue;
-        }
-        if in_package && toml_package_name_is_chaincheck(line) {
-            return true;
-        }
-    }
-    false
-}
-
-fn toml_strip_comment(line: &str) -> &str {
-    let mut in_string = None;
-    for (index, ch) in line.char_indices() {
-        match in_string {
-            Some(quote) if ch == quote => in_string = None,
-            Some(_) => {}
-            None if ch == '"' || ch == '\'' => in_string = Some(ch),
-            None if ch == '#' => return line[..index].trim(),
-            None => {}
-        }
-    }
-    line.trim()
-}
-
-fn is_toml_table_header(line: &str) -> bool {
-    line.starts_with('[') && line.ends_with(']')
-}
-
-fn toml_package_name_is_chaincheck(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("name") else {
+    let Ok(value) = toml::from_str::<toml::Value>(content) else {
         return false;
     };
-    let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix('=') else {
-        return false;
-    };
-    quoted_toml_scalar(rest.trim_start()) == Some("chaincheck")
-}
-
-fn quoted_toml_scalar(value: &str) -> Option<&str> {
-    let quote = value.as_bytes().first().copied()?;
-    if quote != b'"' && quote != b'\'' {
-        return None;
-    }
-    let rest = &value[1..];
-    let end = rest.find(quote as char)?;
-    if !rest[end + 1..].trim().is_empty() {
-        return None;
-    }
-    Some(&rest[..end])
+    value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        == Some("chaincheck")
 }
 
 fn chaincheck_fixture_note_lines() -> Vec<String> {
@@ -698,7 +661,7 @@ mod tests {
     use crate::coverage::{ArtifactStatus, DetectorId};
     use crate::evidence::Finding;
     use crate::intelligence::{
-        parse_malware_feed, EcosystemIntelligence, FeedFailure, IntelligenceSnapshot,
+        EcosystemIntelligence, FeedFailure, IntelligenceSnapshot, parse_malware_feed,
     };
     use crate::model::{
         Ecosystem, EvidenceKind, FindingCode, FindingSubject, PackageIdentity, PackageKey,
@@ -891,16 +854,20 @@ mod tests {
             findings: vec![&fixture_finding],
             evidence_count: 2,
         };
-        assert!(one_other
-            .headline_suffix()
-            .contains("including 1 other evidence finding;"));
+        assert!(
+            one_other
+                .headline_suffix()
+                .contains("including 1 evidence finding not identified as a ChainCheck fixture;")
+        );
         let two_other = FixtureAnnotation {
             findings: vec![&fixture_finding],
             evidence_count: 3,
         };
-        assert!(two_other
-            .headline_suffix()
-            .contains("including 2 other evidence findings;"));
+        assert!(
+            two_other
+                .headline_suffix()
+                .contains("including 2 evidence findings not identified as a ChainCheck fixture;")
+        );
         let empty = FixtureAnnotation {
             findings: vec![],
             evidence_count: 2,
@@ -934,6 +901,8 @@ mod tests {
         assert!(!cargo_toml_identifies_chaincheck(
             "[package]\nname = \"chaincheck-tools\"\n"
         ));
+        assert!(!cargo_toml_identifies_chaincheck("[package]\nname = \n"));
+        assert!(!cargo_toml_identifies_chaincheck("not toml {{{"));
     }
 
     #[test]
@@ -962,10 +931,10 @@ mod tests {
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
         assert!(summary.contains("Result: Review recommended — MEDIUM evidence detected — see ChainCheck fixture note below"));
-        assert!(!summary.contains("other evidence finding"));
+        assert!(!summary.contains("not identified as a ChainCheck fixture;"));
         assert!(summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
-        assert!(summary.contains("Other evidence findings: 0"));
+        assert!(summary.contains("Evidence findings not identified as ChainCheck fixtures: 0"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
         let expected_row = format!(
             "MEDIUM\tlockfile-package\t{}\tsynthetic fixture\n",
@@ -1008,7 +977,7 @@ mod tests {
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
         assert!(summary.contains("Result: Action recommended — strong malware evidence detected — see ChainCheck fixture note below"));
-        assert!(!summary.contains("other evidence finding"));
+        assert!(!summary.contains("not identified as a ChainCheck fixture;"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
         let expected_row = format!(
             "HIGH\tinstalled-package\t{}\tsynthetic installed fixture\n",
@@ -1057,18 +1026,21 @@ mod tests {
         assert_eq!(normal_scan_exit(result.outcome), 2);
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — including 1 other evidence finding; see ChainCheck fixture note below"));
+        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — including 1 evidence finding not identified as a ChainCheck fixture; see ChainCheck fixture note below"));
         assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
-        assert!(summary.contains("Other evidence findings: 1"));
+        assert!(summary.contains("Evidence findings not identified as ChainCheck fixtures: 1"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
         assert!(tsv.contains(&format!(
             "MEDIUM\tlockfile-package\t{}\tsynthetic fixture\n",
             fixture.display()
         )));
-        assert!(tsv.contains("HIGH\tinstalled-package\t/tmp/real-project/package-lock.json\treal installed package\n"));
+        assert!(tsv.contains(
+            "HIGH\tinstalled-package\t/tmp/real-project/package-lock.json\treal installed package\n"
+        ));
         let console = console_brief(&result, &written);
-        assert!(console
-            .contains("including 1 other evidence finding; see ChainCheck fixture note below"));
+        assert!(console.contains(
+            "including 1 evidence finding not identified as a ChainCheck fixture; see ChainCheck fixture note below"
+        ));
         assert!(console.contains(&format!(
             "[MEDIUM] lockfile-package: {} - synthetic fixture {FIXTURE_FINDING_TAG}",
             fixture.display()
@@ -1146,6 +1118,48 @@ mod tests {
         assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         let console = console_brief(&result, &written);
         assert!(!console.contains(FIXTURE_FINDING_TAG));
+        assert_eq!(normal_scan_exit(result.outcome), 1);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn malformed_cargo_toml_is_not_annotated_and_does_not_change_the_finding() {
+        let source = chaincheck_source_tree("[package]\nname =\n");
+        let fixture = source.join("tests/fixtures/npm/package-lock.json");
+        fs::write(&fixture, "{}\n").unwrap();
+        let result = ScanResult {
+            scope: ScanScope::ExplicitRoot {
+                root: source.clone(),
+            },
+            outcome: ScanOutcome::MediumEvidence,
+            intelligence: snap(true, true),
+            findings: vec![finding(
+                Severity::Medium,
+                "lockfile-package",
+                fixture.to_str(),
+                "malformed identity",
+            )],
+            package_evidence: vec![],
+            coverage: vec![],
+        };
+        assert_eq!(result.outcome, ScanOutcome::MediumEvidence);
+        assert_eq!(normal_scan_exit(result.outcome), 1);
+        let (written, report_dir) = write_reports_of(&result);
+        let summary = fs::read_to_string(&written.summary).unwrap();
+        assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
+        assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
+        let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
+        let expected_row = format!(
+            "MEDIUM\tlockfile-package\t{}\tmalformed identity\n",
+            fixture.display()
+        );
+        assert!(tsv.starts_with("severity\tcategory\tlocation\tdetail\n"));
+        assert!(tsv.contains(&expected_row), "{tsv}");
+        assert_eq!(tsv.lines().nth(1).unwrap().split('\t').count(), 4);
+        let console = console_brief(&result, &written);
+        assert!(!console.contains(FIXTURE_FINDING_TAG));
+        assert_eq!(result.outcome, ScanOutcome::MediumEvidence);
         assert_eq!(normal_scan_exit(result.outcome), 1);
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&report_dir);
