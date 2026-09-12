@@ -15,6 +15,10 @@ pub const DET_FILESYSTEM_WALK: DetectorId = DetectorId::from_static("filesystem-
 pub const DEFAULT_WALK_MAX_ENTRIES: u32 = 1_000_000;
 pub const DEFAULT_WALK_MAX_FILES: u32 = 100_000;
 
+const CHAINCHECK_FIXTURE_DETAIL: &str =
+    "skipped ChainCheck's own tests/fixtures synthetic test data";
+const SELF_REPO_METADATA_MAX_BYTES: u64 = 1_000_000;
+
 /// Per-walk bounds on directory entries examined and matching files retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalkLimits {
@@ -167,6 +171,7 @@ pub fn walk_matching_files_for_limited_with_progress(
         .collect();
     let mut budget = EntryBudget::new(limits.max_entries);
     let mut exhausted: Option<&'static str> = None;
+    let mut skipped_chaincheck_fixtures = false;
 
     'walk: while let Some(dir) = stack.pop() {
         if exhausted.is_some() {
@@ -205,6 +210,10 @@ pub fn walk_matching_files_for_limited_with_progress(
                     continue;
                 }
                 let name = entry.file_name();
+                if is_chaincheck_owned_fixture_dir(&dir, &name) {
+                    skipped_chaincheck_fixtures = true;
+                    continue;
+                }
                 if prune_dir(&dir, &name) {
                     continue;
                 }
@@ -230,9 +239,62 @@ pub fn walk_matching_files_for_limited_with_progress(
             limits.max_entries
         };
         coverage.set_detail(format!("stopped after {limit} {kind}"));
+    } else if skipped_chaincheck_fixtures {
+        coverage.set_detail(CHAINCHECK_FIXTURE_DETAIL);
     }
 
     WalkOutcome { files, coverage }
+}
+
+/// Return true only for the synthetic fixture tree in an actual checkout of
+/// the upstream ChainCheck repository. A generic `tests/fixtures` directory is
+/// never excluded: both the package identity and Git remote must match.
+fn is_chaincheck_owned_fixture_dir(parent: &Path, name: &OsStr) -> bool {
+    if name != OsStr::new("fixtures") || parent.file_name() != Some(OsStr::new("tests")) {
+        return false;
+    }
+    let Some(repo_root) = parent.parent() else {
+        return false;
+    };
+    chaincheck_package_identity(repo_root) && chaincheck_upstream_remote(repo_root)
+}
+
+fn chaincheck_package_identity(repo_root: &Path) -> bool {
+    let Some(cargo) = read_small_utf8(&repo_root.join("Cargo.toml")) else {
+        return false;
+    };
+    let mut in_package = false;
+    for line in cargo.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package && line == "name = \"chaincheck\"" {
+            return true;
+        }
+    }
+    false
+}
+
+fn chaincheck_upstream_remote(repo_root: &Path) -> bool {
+    let Some(config) = read_small_utf8(&repo_root.join(".git").join("config")) else {
+        return false;
+    };
+    config.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("url =")
+            && (line.contains("github.com/ldbiz/chaincheck")
+                || line.contains("github.com:ldbiz/chaincheck"))
+    })
+}
+
+fn read_small_utf8(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > SELF_REPO_METADATA_MAX_BYTES {
+        return None;
+    }
+    fs::read_to_string(path).ok()
 }
 
 fn file_type_is_symlink(file_type: FileType, path: &Path) -> bool {
@@ -318,6 +380,72 @@ mod tests {
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
         assert!(open_names.contains(&"hidden.txt"));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn chaincheck_checkout_skips_only_its_owned_fixture_tree() {
+        let root = tmp();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("tests/fixtures/nested")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            b"[package]\nname = \"chaincheck\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".git/config"),
+            b"[remote \"origin\"]\n\turl = https://github.com/ldbiz/chaincheck.git\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/fixtures/nested/synthetic.dat"), b"fixture").unwrap();
+        fs::write(root.join("tests/ordinary.dat"), b"ordinary").unwrap();
+
+        let walked = walk_files([&root], |_p, _n| false);
+        assert!(
+            walked.files.iter().any(|p| p.ends_with("tests/ordinary.dat")),
+            "ordinary test data should still be scanned: {:?}",
+            walked.files
+        );
+        assert!(
+            !walked
+                .files
+                .iter()
+                .any(|p| p.ends_with("tests/fixtures/nested/synthetic.dat")),
+            "owned synthetic fixture tree should be skipped: {:?}",
+            walked.files
+        );
+        assert_eq!(walked.coverage.status(), CoverageStatus::Completed);
+        assert_eq!(walked.coverage.detail(), CHAINCHECK_FIXTURE_DETAIL);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn lookalike_fixture_tree_without_chaincheck_upstream_is_scanned() {
+        let root = tmp();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("tests/fixtures")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            b"[package]\nname = \"chaincheck\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".git/config"),
+            b"[remote \"origin\"]\n\turl = https://github.com/example/chaincheck.git\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/fixtures/synthetic.dat"), b"fixture").unwrap();
+
+        let walked = walk_files([&root], |_p, _n| false);
+        assert!(
+            walked
+                .files
+                .iter()
+                .any(|p| p.ends_with("tests/fixtures/synthetic.dat")),
+            "non-upstream lookalike must not create an exclusion: {:?}",
+            walked.files
+        );
         cleanup(&root);
     }
 
