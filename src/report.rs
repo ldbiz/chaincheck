@@ -16,7 +16,8 @@ pub const PRIVACY_WARNING: &str =
 
 const CONSOLE_EVIDENCE_CAP: usize = 10;
 const SOURCE_IDENTITY_MAX_BYTES: u64 = 1_000_000;
-const FIXTURE_HEADLINE_NOTE: &str = "see ChainCheck fixture note below";
+const FIXTURE_ONLY_HEADLINE_SUFFIX: &str = "likely ChainCheck test fixtures; see note below";
+const FIXTURE_MIXED_HEADLINE_NOTE: &str = "see fixture note below";
 const FIXTURE_FINDING_TAG: &str = "[likely ChainCheck fixture]";
 
 #[derive(Debug)]
@@ -262,7 +263,7 @@ impl<'a> FixtureAnnotation<'a> {
         }
         let unidentified = self.other_count();
         if unidentified == 0 {
-            format!(" — {FIXTURE_HEADLINE_NOTE}")
+            format!(" — {FIXTURE_ONLY_HEADLINE_SUFFIX}")
         } else {
             let noun = if unidentified == 1 {
                 "finding"
@@ -270,7 +271,7 @@ impl<'a> FixtureAnnotation<'a> {
                 "findings"
             };
             format!(
-                " — including {unidentified} evidence {noun} not identified as a ChainCheck fixture; {FIXTURE_HEADLINE_NOTE}"
+                " — including {unidentified} evidence {noun} not identified as a ChainCheck fixture; {FIXTURE_MIXED_HEADLINE_NOTE}"
             )
         }
     }
@@ -377,8 +378,8 @@ fn cargo_toml_identifies_chaincheck(content: &str) -> bool {
 fn chaincheck_fixture_note_lines() -> Vec<String> {
     vec![
         "NOTE: LIKELY CHAINCHECK TEST FIXTURE".to_owned(),
-        "ChainCheck found evidence inside a tests/fixtures directory belonging to a source tree that identifies itself as the ChainCheck package.".to_owned(),
-        "ChainCheck deliberately includes synthetic malware evidence there for testing. These findings have not been suppressed and still count toward the scan result.".to_owned(),
+        "Some evidence findings match synthetic malware test data under tests/fixtures in a source tree that identifies itself as the ChainCheck package.".to_owned(),
+        "This annotation does not suppress findings, reduce severity, or change the scan exit code. MEDIUM, HIGH, and CONFIRMED still mean the same as for any other evidence.".to_owned(),
         "If this is a ChainCheck source checkout, these fixture findings are expected and do not by themselves show that the malicious package was installed or that the host was compromised.".to_owned(),
         "The installed ChainCheck binary does not require the source checkout. If you cloned or downloaded the source only to install ChainCheck, you may remove that source tree; later system-wide scans will then not encounter its bundled fixtures.".to_owned(),
         "If you did not expect this path to contain ChainCheck test data, investigate the finding normally.".to_owned(),
@@ -848,7 +849,7 @@ mod tests {
         };
         assert_eq!(
             fixture_only.headline_suffix(),
-            format!(" — {FIXTURE_HEADLINE_NOTE}")
+            format!(" — {FIXTURE_ONLY_HEADLINE_SUFFIX}")
         );
         let one_other = FixtureAnnotation {
             findings: vec![&fixture_finding],
@@ -930,9 +931,14 @@ mod tests {
         assert_eq!(normal_scan_exit(result.outcome), 1);
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(summary.contains("Result: Review recommended — MEDIUM evidence detected — see ChainCheck fixture note below"));
+        assert!(summary.contains("Result: Review recommended — MEDIUM evidence detected — likely ChainCheck test fixtures; see note below"));
         assert!(!summary.contains("not identified as a ChainCheck fixture;"));
         assert!(summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
+        assert!(
+            summary.contains(
+                "does not suppress findings, reduce severity, or change the scan exit code"
+            )
+        );
         assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
         assert!(summary.contains("Evidence findings not identified as ChainCheck fixtures: 0"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
@@ -944,7 +950,7 @@ mod tests {
         assert!(tsv.contains(&expected_row), "{tsv}");
         assert_eq!(tsv.lines().nth(1).unwrap().split('\t').count(), 4);
         let console = console_brief(&result, &written);
-        assert!(console.contains("see ChainCheck fixture note below"));
+        assert!(console.contains("likely ChainCheck test fixtures; see note below"));
         assert!(console.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         assert!(console.contains(FIXTURE_FINDING_TAG));
         assert_eq!(result.outcome, ScanOutcome::MediumEvidence);
@@ -976,7 +982,7 @@ mod tests {
         assert_eq!(normal_scan_exit(result.outcome), 2);
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — see ChainCheck fixture note below"));
+        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — likely ChainCheck test fixtures; see note below"));
         assert!(!summary.contains("not identified as a ChainCheck fixture;"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
         let expected_row = format!(
@@ -1026,7 +1032,7 @@ mod tests {
         assert_eq!(normal_scan_exit(result.outcome), 2);
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — including 1 evidence finding not identified as a ChainCheck fixture; see ChainCheck fixture note below"));
+        assert!(summary.contains("Result: Action recommended — strong malware evidence detected — including 1 evidence finding not identified as a ChainCheck fixture; see fixture note below"));
         assert!(summary.contains("Likely ChainCheck test fixtures: 1"));
         assert!(summary.contains("Evidence findings not identified as ChainCheck fixtures: 1"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
@@ -1039,7 +1045,7 @@ mod tests {
         ));
         let console = console_brief(&result, &written);
         assert!(console.contains(
-            "including 1 evidence finding not identified as a ChainCheck fixture; see ChainCheck fixture note below"
+            "including 1 evidence finding not identified as a ChainCheck fixture; see fixture note below"
         ));
         assert!(console.contains(&format!(
             "[MEDIUM] lockfile-package: {} - synthetic fixture {FIXTURE_FINDING_TAG}",
@@ -1082,7 +1088,7 @@ mod tests {
         };
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
+        assert!(!summary.contains(FIXTURE_ONLY_HEADLINE_SUFFIX));
         assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         let console = console_brief(&result, &written);
         assert!(!console.contains(FIXTURE_FINDING_TAG));
@@ -1114,7 +1120,7 @@ mod tests {
         };
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
+        assert!(!summary.contains(FIXTURE_ONLY_HEADLINE_SUFFIX));
         assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         let console = console_brief(&result, &written);
         assert!(!console.contains(FIXTURE_FINDING_TAG));
@@ -1147,7 +1153,7 @@ mod tests {
         assert_eq!(normal_scan_exit(result.outcome), 1);
         let (written, report_dir) = write_reports_of(&result);
         let summary = fs::read_to_string(&written.summary).unwrap();
-        assert!(!summary.contains(FIXTURE_HEADLINE_NOTE));
+        assert!(!summary.contains(FIXTURE_ONLY_HEADLINE_SUFFIX));
         assert!(!summary.contains("NOTE: LIKELY CHAINCHECK TEST FIXTURE"));
         let tsv = fs::read_to_string(&written.findings_tsv).unwrap();
         let expected_row = format!(
