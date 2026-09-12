@@ -55,6 +55,8 @@ cp target/release/chaincheck ~/.local/bin/chaincheck
 chmod +x ~/.local/bin/chaincheck
 ```
 
+After copying the binary, the source checkout is not required to run ChainCheck. The checkout contains deliberately malicious-looking synthetic fixtures for testing; a later system-wide scan can find those fixtures if you leave the checkout under a scanned root. Keep the checkout if you are developing ChainCheck; otherwise it may be removed after installation.
+
 ### Install script
 
 The script runs the same Cargo build and copies the binary to `~/.local/bin/chaincheck`. It does not download a prebuilt release. Use this when the release binary does not match your host glibc. Requires `git` and `cargo`.
@@ -63,7 +65,7 @@ The script runs the same Cargo build and copies the binary to `~/.local/bin/chai
 curl -fsSL https://raw.githubusercontent.com/ldbiz/chaincheck/main/scripts/install.sh | bash
 ```
 
-From a clone, run `./scripts/install.sh` instead.
+From a clone, run `./scripts/install.sh` instead. When run from an existing checkout, the script reminds you that the checkout is not required by the installed binary and that its synthetic fixtures can appear in system-wide scans. The one-line `curl` form uses a temporary clone and removes it automatically when installation completes.
 
 ## Basic usage
 
@@ -91,6 +93,8 @@ chaincheck --self-test
 - **Review recommended:** MEDIUM evidence needs manual interpretation.
 - **Action recommended:** HIGH/CONFIRMED is strong evidence requiring investigation, but evidence presence does not necessarily prove payload execution.
 - **Incomplete scan:** required Aikido intelligence was unavailable or invalid, so an otherwise-clean scan cannot be reported as clean.
+
+If a finding is under a recognized ChainCheck source tree's `tests/fixtures` directory, ChainCheck keeps the finding and its normal severity but marks the report headline with **`see ChainCheck fixture note below`**. The note explains that the source repository deliberately contains synthetic malware evidence and separately counts likely fixture findings and other evidence findings. This is annotation only: it does not suppress findings, weaken matching, or change the scan exit code. If the path is not one you recognize as ChainCheck test data, investigate it normally.
 
 ## Retrospective checking is not ongoing protection
 
